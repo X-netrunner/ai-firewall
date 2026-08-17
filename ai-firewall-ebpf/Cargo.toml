@@ -1,0 +1,18 @@
+[package]
+name = "ai-firewall-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+ai-firewall-common = { path = "../ai-firewall-common" }
+network-types = "0.0.5" # 1.2
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "ai-firewall"
+path = "src/main.rs"

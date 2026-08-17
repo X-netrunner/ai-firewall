@@ -1,0 +1,40 @@
+libraries :
+    HashMap
+
+terms :
+    1)Ring Buffer
+    2)PrefEventArray
+    3) PacketLog
+
+explanation:
+    1) Ring buffers are used to store packet metrics in a circular buffer, allowing efficient logging and telemetry.
+    2) PrefEventArray is used to store precomputed event data in a shared memory buffer.
+    3) PacketLog is used to store packet log data in a shared memory buffer.
+
+main:
+        not a big session just to test out if it the blocklist is working which it is so yeah good job me lol.
+            6d5
+        < use aya::maps::HashMap;
+        11d9
+        < use std::net::Ipv4Addr;
+        71,83d68
+        <     //3.1
+        <     //6. Populating the ebpf blocklist map from userspace
+        <     let mut blocklist: HashMap<_, u32, u32> =
+        <     	HashMap::try_from(ebpf.map_mut("BLOCKLIST").unwrap())?;
+        <
+        <     // Blocking 8.8.8.8
+        <     let block_ip: Ipv4Addr = "8.8.8.8".parse()?;
+        <     let ip_u32 = u32::from(block_ip); // Converts IP to native u32 format
+        <
+        <     //write IP into the eBPF map shared with kernel space ( key : IP , value : 1 flag)
+        <    	blocklist.insert(ip_u32, 1, 0)?;
+        <    	info!("Successfully added {} (u32: {}) to eBPF BLOCKLIST map!", block_ip, ip_u32);
+        <
+
+        next up :
+             now that verified packet parsing , eBPF map sharing ,kernel dropping  we kinda finished the fundamentals
+             Build a Metrics / Telemetry Ring Buffer: Instead of just sending info! log strings, have eBPF stream structured binary packet metrics (source IP, destination port, packet count, time delta) to userspace.
+             why are we doing this first before lets say add icmp header parsing or rule engine or ai integration ? because
+                - this is the prerequisite for ai : usually an ai or rule engine needs structured data to calculate anomaly scores
+                - efficiency : using eBPF RingBuf or PrefEventArray to stream raw binary structs which is PacketLog is significantly faster than sending log strings

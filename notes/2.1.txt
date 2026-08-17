@@ -1,0 +1,101 @@
+libraries :
+    1) maps?
+
+terms :
+    1) POD
+    2) #[]
+    3) dest
+    4) macros
+    5) ELF sections
+
+explanation:
+    1) Plain Old Data :Tells aya that this struct can safely be copied raw across byte buffers.
+    2) that is an attribute which is a metadata
+    3) Destination Port
+    4) they are to write programs which write other programs.
+    5) ELF sections : are distinct, contiguous blocks of code, data, or metadata inside an Executable and Linkable Format file that provide a structured view for linkers and debuggers
+
+main:
+    as of now i only made a program which can read ips passively and do nothing about it other than pass XDP_PASS
+    to make my project i would need to
+        1) Parse layer 4 protocols headers (tcp and udp) : from here i want to extract the destination port and flags like syn and what not so i can detect scans and floods
+        2) creating an eBPF block list map (hashmap or lruhashmap) : this will be used to allow the ai and usespace to insert in malicious ip address to block into the kernel space itself so eBPF can block them by XDP_DROP with zero CPU overhead.
+
+    SO like i said i did divide my program into the kernel space and userpspace @ai-firewall-ebpf and @ai-firewall respectively. but there will be resources which have to be shared with both of them like the hashmap hence i will put those into a common space called @ai-firewall-common
+
+    the code in @ai-firewall-common/src/lib.rs::
+        the #![no_std] --> this will disable the standard library and use a custom allocator instead
+        the #[repr(C)] --> this will ensure the struct layout is compatible with C prevents rust from rearaging the struct fields for optimization .Guarantees C-compatible memory layout so both kernel space and userspace interpret memory offsets identically
+        the u32 and what not are unsigned integers
+
+
+    i will upgrade the kernel level @ai-firewall-ebpf more now to include hashmap support named BLOCKLIST , inspect IP protocols IpProto::Tcp or IpProto::Udp
+    we will check if the ip is in the BLOCKLIST if it is then we will return xdp_action::
+
+    #[map] static BLOCKLIST creates a hashmap named BLOCKLIST which will be used to store the ip addresses to block ofc u32 is only for ipv4
+    xdp_action::XDP_DROP instructs the kernel to drop the packet at the lowest level before the linux kernel processes it
+    We check transport_start + TcpHdr::LEN <= end before reading TcpHdr. Again, mandatory for the verifier!
+
+    '''
+    10,11c10
+< 	macros::{map, xdp}, --< map, xdp: Procedural macros to register eBPF maps and XDP program entry points.
+< 	maps::HashMap, --< HashMap: An eBPF key-value map data structure stored in kernel memory
+---
+> 	macros::xdp,
+19,26c18,19  --< imports memory-mapped struct definitions representing standard network protocol headers and their field enums.
+< 	ip::{IpProto,Ipv4Hdr},
+< 	tcp::TcpHdr,
+< 	udp::UdpHdr,
+< };
+<
+< //2.1
+< #[map] --< instructs aya to emit an ELF section that the kernel will use to create eBPF maps.
+< static BLOCKLIST: HashMap<u32, u32> =Hashmap::<u32, u32>::with_max_entries(1024,0); --< defines a global kernel map wqhich stores key-value pairs of blocked IP and value like flag or count. the last with_max_entries(1024,0) Allocates capacity for up to 10,240 entries inside kernel memory. The second argument (0) represents map flags.
+---
+> 	ip::Ipv4Hdr,
+> }; //1.2
+56c49
+<     }
+---
+>     } // OPTIONAL CHECK TO SEE if buffer has enough bytes for ipv4 header
+60d52 --<proto: Extracts the Layer 4 transport protocol ID (e.g., TCP or UDP)
+< 	let proto = ip_hdr.proto;
+62,67c54 --< the BLOCKLIST.get performs a lookup using the IP as the key  .is_some() triggers if the ip is in the map.
+<     //info!(&ctx, "Imbound IPv4 packet from IP : {:i}" ,src_ip);
+<
+< 	if unsafe { BLOCKLIST.get(&src_ip) }.is_some(){
+< 		info!(&ctx, "[BLOCKED] Dropping packet from IP: {:i}",src_ip);
+< 		return Ok(xdp_action::XDP_DROP);
+< 	}
+---
+>     info!(&ctx, "Imbound IPv4 packet from IP : {:i}" ,src_ip);
+69,94d55 --<
+< 	let transport_start= ip_start.wrapping_add(Ipv4Hdr::LEN);
+<
+< 	match proto {
+< 		IpProto::Tcp => {
+< 			if transport_start.wrapping_add(TcpHdr::LEN) <=end {
+< 				let tcp_hdr = unsafe {&*(transport_start as *const TcpHdr) };
+< 				let dst_port = u16::from_be(tcp_hdr.dest);
+< 				info!(
+< 					&ctx,
+< 					"Inbound TCP packet from {:i} to port {}",src_ip ,dst_port
+< 				);
+< 			}
+< 		}
+< 		IpProto::Udp => {
+< 					if transport_start.wrapping_add(UdpHdr::LEN) <=end {
+< 						let udp_hdr = unsafe {&*(transport_start as *const UdpHdr) };
+< 						let dst_port = u16::from_be(udp_hdr.dest);
+< 						info!(
+< 							&ctx,
+< 							"Inbound UDP packet from {:i} to port {}",src_ip ,dst_port
+< 						);
+< 					}
+< 				}
+< 			_ => {}
+< 	}
+<
+96c57
+< }
+    '''

@@ -1,0 +1,35 @@
+terms:
+    1) headers
+    2) trace pipe
+    3) arp
+    4) byte-shifting arrays
+
+explainatons:
+    1) Headers are the metadata that describe the packet, including its source and destination IP addresses, protocol type, and other information.
+    2) Trace pipe is a mechanism for sending trace events from the kernel to user space.
+    3) ARP is the Address Resolution Protocol, used to map IP addresses to MAC addresses on a local network.
+    4) Byte-shifting arrays are used to extract specific fields from packet data by shifting and masking the data.
+
+main :
+    We are going to start writing main.rs inside @ai-firewall-ebpf
+    now i will inspect incomming packets , parse their ethernet and ipv4 headers ,xtract their source ip and sprint it to the ebpf trace pipe (/sys/kernel/tracing/trace_pipe)
+    So  when the incoming packets hit the wlan0 eBPF/XDG gives us two memroy pointers inside the XdpContext struct
+        1) ctx.data() : a pointer to the start of the packet data
+        2) ctx.data_end() : a pointer to the end of the packet data
+    because a packacts is just a sequence of bytes , headers are just layered inside it.
+        1) ethernet header : size 14 bytes , contains mac addrress and tells us if the payload is a IPv4 , IPv6 , ARP or others.
+        2) ipv4 header : size ATLEAST 20 bytes , contains the source and destination ip address , protocol type , and other information.
+        3) tcp/udp header : size ATLEAST 20 bytes , port numbers and connection flags.
+        note: to keep it simple i did ipv4 for now i will extend this to ipv6 later
+
+    Something very impoprt to know is that the linux kernal verifier to extremely strict . before letting your code run , it will check every single memeory access to ensure you will  never read out-of-bounds memory . for example if you try to  read 14 bytes into the packet data without explicitly proving to rust/eBPF that data + 14 <= data_end()  the kernel will reject your code for sure.
+
+    > ADDING NETWORK  CRATE DEPENDENCIES
+        for making the parsing headers structs clean without manually writting byte-shifing arrays , we can use std low level netowkring definations from the network defination from the networkt-type  crate.
+
+        since we are using rust we got to write into the toml of @ai-firewall-edbpf and add network-types into the dependencies section.
+
+    wrote main.rs in @ai-firewall-edbpf/src/
+        #![no_std]: Kernel programs cannot use Rust's standard library (std) because there is no OS allocation runtime inside the eBPF sandboxed VM.
+        unsafe { &*(pointer as *const Struct) }: Reinterprets a raw byte array in memory as a structured format. It's marked unsafe because Rust cannot automatically verify raw hardware memory addresses—so we must handle the bounds checking manually beforehand.
+        u32::from_be(...): Network protocols communicate in Big Endian byte ordering (most significant byte first), whereas x86 CPUs read memory in Little Endian. from_be converts network bytes to standard CPU order.

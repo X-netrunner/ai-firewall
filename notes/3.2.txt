@@ -1,0 +1,48 @@
+libraries :
+
+terms :
+
+explanation:
+
+main:
+    now lets update @ai-firewall-common/src/lib.rs to define the exact binary format of packet events streamed from kernel to userspace.
+    14d13 >-- Memory padding to align struct to 4 bytes
+        < 	pub _pad: u8,
+    now lets stream events from the kernel to userspace using the defined binary format via RingBuf in @ai-firewall-ebpf/src/main.rs
+
+        2c2
+        < // 1.2 || 2.1 || 3.2
+        ---
+        > // 1.2 || 2.1
+        8d7 >-- including HashMap , RingBuf
+        < use ai_firewall_common::PacketEvent;
+        12,13c11,12
+        < 	maps::{HashMap, RingBuf},
+        < 	programs::XdpContext,
+        ---
+        > 	maps::HashMap,
+        > 	programs::XdpContext
+        29,31d27 >-- a static RingBuf map for storing packet events
+        < #[map]
+        < static EVENTS: RingBuf = RingBuf::with_byte_size(16777216, 0);
+        <
+        41c37
+        <     //info!(&ctx, "received a packet");
+        ---
+        >     info!(&ctx, "received a packet");
+        63d58 >-- extracting source IP and destination port from the packet
+        < 	let src_addr = ip_hdr.src_addr;
+        75d69 >-- extracting destination port from the packet
+        < 	let mut dst_port: u16 = 0;
+        99,109d92 >-- extracting protocol from the packet
+        < 	}
+        <
+        < 	//3.2
+        < 	if let Some(mut entry) = EVENTS.reserve::<PacketEvent>(0) {
+        < 		entry.write(PacketEvent {
+        < 			src_ip,
+        < 			dst_port,
+        < 			protocol: proto as u8,
+        < 			_pad: 0,
+        < 		});
+        < 		entry.submit(0);
