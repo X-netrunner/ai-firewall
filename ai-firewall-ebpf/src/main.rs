@@ -59,8 +59,7 @@ fn try_ai_firewall(ctx: XdpContext) -> Result<u32, ()> {
     	return Ok(xdp_action::XDP_PASS);
     }
 
-    let ip_hdr = unsafe {&*(ip_start as *const Ipv4Hdr) };
-	let src_addr = ip_hdr.src_addr;
+    let ip_hdr = unsafe { &*(ip_start as *const Ipv4Hdr) };
     let src_ip = u32::from_be(ip_hdr.src_addr);
 	let proto = ip_hdr.proto;
     
@@ -76,26 +75,18 @@ fn try_ai_firewall(ctx: XdpContext) -> Result<u32, ()> {
 
 	match proto {
 		IpProto::Tcp => {
-			if transport_start.wrapping_add(TcpHdr::LEN) <=end {
-				let tcp_hdr = unsafe {&*(transport_start as *const TcpHdr) };
-				let dst_port = u16::from_be(tcp_hdr.dest);
-				info!(
-					&ctx,
-					"Inbound TCP packet from {:i} to port {}",src_ip ,dst_port
-				);
+			if transport_start.wrapping_add(TcpHdr::LEN) <= end {
+				let tcp_hdr = unsafe { &*(transport_start as *const TcpHdr) };
+				dst_port = u16::from_be(tcp_hdr.dest);
 			}
 		}
 		IpProto::Udp => {
-					if transport_start.wrapping_add(UdpHdr::LEN) <=end {
-						let udp_hdr = unsafe {&*(transport_start as *const UdpHdr) };
-						let dst_port = u16::from_be(udp_hdr.dest);
-						info!(
-							&ctx,
-							"Inbound UDP packet from {:i} to port {}",src_ip ,dst_port
-						);
-					}
-				}
-			_ => {}
+			if transport_start.wrapping_add(UdpHdr::LEN) <= end {
+				let udp_hdr = unsafe { &*(transport_start as *const UdpHdr) };
+				dst_port = u16::from_be(udp_hdr.dest);
+			}
+		}
+		_ => {}
 	}
 
 	//3.2

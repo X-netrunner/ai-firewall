@@ -23,19 +23,45 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(5); // Sweeper runs every
 
 #[derive(Debug, Parser)]
 struct Opt {
-   /// Interface to attach XDP to (e.g. lo, wlan0, eth0)
+    /// Interface to attach XDP to (e.g. lo, wlan0, eth0)
     #[clap(short, long, default_value = "wlan0")]
     iface: String,
+
+    /// Force Generic SKB mode for XDP (required for lo, wlan0, etc.)
+    #[clap(long)]
+    skb: bool,
+
+    /// Verbose mode: log every single packet (default logs first packet and count milestones)
+    #[clap(short, long)]
+    verbose: bool,
+
+    /// Filter to only monitor traffic to a specific destination port (e.g. -p 120)
+    #[clap(short = 'p', long)]
+    port: Option<u16>,
+
+    /// Auto-block threshold (number of packets before blocking an IP, default: 100)
+    #[clap(short, long, default_value_t = 100)]
+    threshold: u32,
+
+    /// Include background mDNS (5353), SSDP (1900), and broadcast discovery noise in logs
+    #[clap(long)]
+    include_noise: bool,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::parse();
 
-    // 1. Initialize userspace logger
-    env_logger::init();
+    // 1. Initialize userspace logger with INFO as default level if not set
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+
+    println!("╔═════════════════════════════════════════════════════════════╗");
+    println!("║                 AI FIREWALL CONTROLLER (XDP)                ║");
+    println!("╚═════════════════════════════════════════════════════════════╝");
+    info!("[*] Initializing AI Firewall...");
 
     // 2. Bump the memlock rlimit (needed for kernel memory allocation)
+    info!("[*] Adjusting memory lock limit (RLIMIT_MEMLOCK)...");
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
@@ -46,12 +72,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // 3. Load the compiled eBPF bytecode embedded inside the binary
+    info!("[*] Loading compiled eBPF bytecode into kernel...");
     let mut ebpf = aya::Ebpf::load(aya::include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/ai-firewall"
     )))?;
+    info!("[+] Successfully loaded eBPF bytecode!");
 
     // 4. Initialize eBPF Logger (reads info! logs sent from kernel space)
+    info!("[*] Initializing kernel eBPF logger bridge...");
     match EbpfLogger::init(&mut ebpf) {
         Err(e) => {
             warn!("[!] failed to initialize eBPF logger: {e}");
@@ -66,18 +95,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     guard.clear_ready();
                 }
             });
+            info!("[+] eBPF logger bridge active.");
         }
     }
 
     // 5. Attach XDP program dynamically based on CLI input
-    let Opt { iface } = opt;
+    let Opt {
+        iface,
+        skb,
+        verbose,
+        port: filter_port,
+        threshold,
+        include_noise,
+    } = opt;
+
+    info!("[*] Attaching XDP program to network interface '{}'...", iface);
     let program: &mut Xdp = ebpf.program_mut("ai_firewall").unwrap().try_into()?;
     program.load()?;
-    program
-        .attach(&iface, XdpMode::default())
-        .context(format!("[!] failed to attach XDP program to {iface}"))?;
 
-    info!("[*] AI Firewall attached to interface '{iface}'. Waiting for events...");
+    if skb {
+        program
+            .attach(&iface, XdpMode::Skb)
+            .context(format!("[!] failed to attach XDP program to {iface} in SKB mode"))?;
+        info!("[+] Attached XDP program to '{}' in Generic (SKB) mode.", iface);
+    } else {
+        match program.attach(&iface, XdpMode::default()) {
+            Ok(_) => {
+                info!("[+] Attached XDP program to '{}' in Native (Driver) mode.", iface);
+            }
+            Err(err) => {
+                debug!("[*] Driver mode not supported on {} ({}), trying Generic (SKB) mode...", iface, err);
+                program
+                    .attach(&iface, XdpMode::Skb)
+                    .context(format!("[!] failed to attach XDP program to {iface} in SKB mode"))?;
+                info!("[+] Attached XDP program to '{}' in Generic (SKB) mode.", iface);
+            }
+        }
+    }
 
     // 6. Access eBPF BLOCKLIST map
     let blocklist_map = ebpf
@@ -86,7 +140,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let blocklist: HashMap<_, u32, u32> = HashMap::try_from(blocklist_map)?;
     let blocklist = Arc::new(TokioMutex::new(blocklist));
 
-    // Shared in-memory tracker for block timestamps: IP (u32 Network Byte Order) -> Instant
+    // Shared in-memory tracker for block timestamps: IP (u32 Host Byte Order) -> Instant
     let blocked_timestamps: Arc<TokioMutex<StdHashMap<u32, Instant>>> =
         Arc::new(TokioMutex::new(StdHashMap::new()));
 
@@ -120,13 +174,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         timestamps.remove(&ip);
                         info!(
                             "[*] [TTL-EXPIRED] Unblocked IP {} from eBPF BLOCKLIST.",
-                            Ipv4Addr::from(u32::from_be(ip))
+                            Ipv4Addr::from(ip)
                         );
                     }
                 }
             }
         }
     });
+    info!("[+] Auto-unblock TTL sweeper running (Block TTL: {}s, Interval: {}s)", BLOCK_TTL.as_secs(), CLEANUP_INTERVAL.as_secs());
 
     // -------------------------------------------------------------
     // TASK B: Consume RingBuf packet events
@@ -136,6 +191,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut async_fd = tokio::io::unix::AsyncFd::new(ring_buf)?;
         let blocklist_clone = Arc::clone(&blocklist);
         let timestamps_clone = Arc::clone(&blocked_timestamps);
+
+        if let Some(target_p) = filter_port {
+            info!("[*] Port filter active: only monitoring port {}", target_p);
+        }
+        if !include_noise {
+            info!("[*] Filtering out mDNS (5353) and SSDP (1900) broadcast noise from log. (Use --include-noise to view all)");
+        }
 
         tokio::task::spawn(async move {
             let mut packet_counts: StdHashMap<u32, u32> = StdHashMap::new();
@@ -151,29 +213,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let event = unsafe { &*(data.as_ptr() as *const PacketEvent) };
-                    
-                    // Convert network byte order to host byte order for readable display
-                    let src_ip_host = u32::from_be(event.src_ip);
-                    let ip = Ipv4Addr::from(src_ip_host);
+
+                    // Filter out multicast/discovery noise (mDNS 5353, SSDP 1900, LLMNR 5355, NetBIOS 137/138)
+                    let is_noise_port = matches!(event.dst_port, 5353 | 1900 | 5355 | 137 | 138);
+                    if is_noise_port && !include_noise {
+                        continue;
+                    }
+
+                    // Apply port filter if configured
+                    if let Some(target_p) = filter_port {
+                        if event.dst_port != target_p {
+                            continue;
+                        }
+                    }
+
+                    let ip = Ipv4Addr::from(event.src_ip);
+                    let proto_str = match event.protocol {
+                        1 => "ICMP",
+                        6 => "TCP",
+                        17 => "UDP",
+                        _ => "OTHER",
+                    };
 
                     let count = packet_counts.entry(event.src_ip).or_insert(0);
                     *count += 1;
 
-                    info!(
-                        "[*] [EVENT] IP: {:15} | Port: {:5} | Proto: {:3} | Total: {}",
-                        ip, event.dst_port, event.protocol, count
-                    );
+                    // Log in verbose mode OR on first packet / milestones (every 25 packets)
+                    if verbose || *count == 1 || *count % 25 == 0 || *count >= threshold {
+                        info!(
+                            "[*] [EVENT] IP: {:15} | Port: {:5} | Proto: {:5} | Count: {}",
+                            ip, event.dst_port, proto_str, count
+                        );
+                    }
 
-                    // Threshold Auto-Block Rule (>100 packets)
-                    if *count > 100 {
+                    // Threshold Auto-Block Rule
+                    if *count > threshold {
                         let mut map = blocklist_clone.lock().await;
                         let mut timestamps = timestamps_clone.lock().await;
 
                         if map.insert(event.src_ip, 1, 0).is_ok() {
                             timestamps.insert(event.src_ip, Instant::now());
                             warn!(
-                                "[!] [AUTO-BLOCK] IP {} exceeded packet threshold! Added to BLOCKLIST for {}s.",
+                                "[!] [AUTO-BLOCK] IP {} exceeded threshold of {} packets! Added to BLOCKLIST for {}s.",
                                 ip,
+                                threshold,
                                 BLOCK_TTL.as_secs()
                             );
                             *count = 0; // Reset counter after inserting into map
@@ -184,10 +267,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 guard.clear_ready();
             }
         });
+        info!("[+] RingBuf event listener registered (Threshold: {} packets).", threshold);
     }
 
+    info!("[+] AI Firewall is ACTIVE and monitoring '{}'. Press Ctrl+C to stop.", iface);
+
     signal::ctrl_c().await?;
-    info!("Exiting firewall...");
+    info!("[*] Received shutdown signal. Detaching firewall and exiting...");
 
     Ok(())
 }
