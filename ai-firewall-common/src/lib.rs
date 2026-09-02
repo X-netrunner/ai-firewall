@@ -6,13 +6,12 @@
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PacketLog {
-	pub ipv4_src: u32,
-	pub ipv4_dst: u32,
-	pub port: u16,
-	pub protocol: u8,
-	pub _pad: u8,
+pub struct PacketEvent {
+    pub src_ip: u32,
+    pub dst_port: u16,
+    pub protocol: u8,
+    pub _pad: u8, // Memory padding to align struct to 4 bytes
 }
 
 #[cfg(feature = "user")]
-unsafe impl aya::Pod for PacketLog {}
+unsafe impl aya::Pod for PacketEvent {}

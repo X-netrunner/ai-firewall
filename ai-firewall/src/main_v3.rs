@@ -1,6 +1,5 @@
 //---------------------------
-// 1.3 || 3.1 || 3.2 || 4.1
-// Userspace eBPF Firewall Controller
+// 1.3 || 3.1 || 3.2
 //---------------------------
 
 use ai_firewall_common::PacketEvent;
@@ -14,16 +13,11 @@ use std::collections::HashMap as StdHashMap;
 use std::convert::TryFrom;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::Mutex as TokioMutex;
 
-const BLOCK_TTL: Duration = Duration::from_secs(60); // IPs stay blocked for 60 seconds
-const CLEANUP_INTERVAL: Duration = Duration::from_secs(5); // Sweeper runs every 5 seconds
-
 #[derive(Debug, Parser)]
 struct Opt {
-   /// Interface to attach XDP to (e.g. lo, wlan0, eth0)
     #[clap(short, long, default_value = "wlan0")]
     iface: String,
 }
@@ -35,7 +29,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize userspace logger
     env_logger::init();
 
-    // 2. Bump the memlock rlimit (needed for kernel memory allocation)
+    // 2. Bump the memlock rlimit (needed for older kernel memory accounting)
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
         rlim_max: libc::RLIM_INFINITY,
@@ -69,73 +63,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // 5. Attach XDP program dynamically based on CLI input
+    // 5. Attach XDP program to network interface
     let Opt { iface } = opt;
     let program: &mut Xdp = ebpf.program_mut("ai_firewall").unwrap().try_into()?;
     program.load()?;
     program
         .attach(&iface, XdpMode::default())
-        .context(format!("[!] failed to attach XDP program to {iface}"))?;
+        .context("[!] failed to attach the XDP program with default mode - try changing XdpMode::default() to XdpMode::Skb")?;
 
-    info!("[*] AI Firewall attached to interface '{iface}'. Waiting for events...");
+    info!("[*] AI Firewall attached to {iface}. Waiting for Ctrl-C...");
 
-    // 6. Access eBPF BLOCKLIST map
+    // 6. Populating the ebpf blocklist map from userspace using `take_map` (owns the map)
     let blocklist_map = ebpf
         .take_map("BLOCKLIST")
         .context("failed to find BLOCKLIST map")?;
     let blocklist: HashMap<_, u32, u32> = HashMap::try_from(blocklist_map)?;
     let blocklist = Arc::new(TokioMutex::new(blocklist));
 
-    // Shared in-memory tracker for block timestamps: IP (u32 Network Byte Order) -> Instant
-    let blocked_timestamps: Arc<TokioMutex<StdHashMap<u32, Instant>>> =
-        Arc::new(TokioMutex::new(StdHashMap::new()));
+    // Blocking 8.8.8.8
+    let block_ip: Ipv4Addr = "8.8.8.8".parse()?;
+    let ip_u32 = u32::from(block_ip); // Converts IP to native u32 format
 
-    // -------------------------------------------------------------
-    // TASK A: Auto-Unblock Cleanup Loop (TTL Sweeper)
-    // -------------------------------------------------------------
-    let blocklist_cleaner = Arc::clone(&blocklist);
-    let timestamps_cleaner = Arc::clone(&blocked_timestamps);
+    // Write IP into the eBPF map shared with kernel space ( key : IP , value : 1 flag)
+    blocklist.lock().await.insert(ip_u32, 1, 0)?;
+    info!("[*] Successfully added {} (u32: {}) to eBPF BLOCKLIST map!", block_ip, ip_u32);
 
-    tokio::task::spawn(async move {
-        let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
-        loop {
-            interval.tick().await;
-
-            let now = Instant::now();
-            let mut timestamps = timestamps_cleaner.lock().await;
-
-            // Find all IPs that have passed the TTL threshold
-            let expired_ips: Vec<u32> = timestamps
-                .iter()
-                .filter(|(_, added_at)| now.duration_since(**added_at) >= BLOCK_TTL)
-                .map(|(&ip, _)| ip)
-                .collect();
-
-            if !expired_ips.is_empty() {
-                let mut map = blocklist_cleaner.lock().await;
-
-                // Remove expired IPs from eBPF map and internal tracker
-                for ip in expired_ips {
-                    if map.remove(&ip).is_ok() {
-                        timestamps.remove(&ip);
-                        info!(
-                            "[*] [TTL-EXPIRED] Unblocked IP {} from eBPF BLOCKLIST.",
-                            Ipv4Addr::from(u32::from_be(ip))
-                        );
-                    }
-                }
-            }
-        }
-    });
-
-    // -------------------------------------------------------------
-    // TASK B: Consume RingBuf packet events
-    // -------------------------------------------------------------
+    // 7. Consume binary RingBuf packet events using `take_map`
     if let Some(events_map) = ebpf.take_map("EVENTS") {
         let ring_buf = RingBuf::try_from(events_map)?;
         let mut async_fd = tokio::io::unix::AsyncFd::new(ring_buf)?;
         let blocklist_clone = Arc::clone(&blocklist);
-        let timestamps_clone = Arc::clone(&blocked_timestamps);
 
         tokio::task::spawn(async move {
             let mut packet_counts: StdHashMap<u32, u32> = StdHashMap::new();
@@ -151,10 +108,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
 
                     let event = unsafe { &*(data.as_ptr() as *const PacketEvent) };
-                    
-                    // Convert network byte order to host byte order for readable display
-                    let src_ip_host = u32::from_be(event.src_ip);
-                    let ip = Ipv4Addr::from(src_ip_host);
+                    let ip = Ipv4Addr::from(event.src_ip);
 
                     let count = packet_counts.entry(event.src_ip).or_insert(0);
                     *count += 1;
@@ -164,19 +118,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ip, event.dst_port, event.protocol, count
                     );
 
-                    // Threshold Auto-Block Rule (>100 packets)
                     if *count > 100 {
                         let mut map = blocklist_clone.lock().await;
-                        let mut timestamps = timestamps_clone.lock().await;
-
                         if map.insert(event.src_ip, 1, 0).is_ok() {
-                            timestamps.insert(event.src_ip, Instant::now());
-                            warn!(
-                                "[!] [AUTO-BLOCK] IP {} exceeded packet threshold! Added to BLOCKLIST for {}s.",
-                                ip,
-                                BLOCK_TTL.as_secs()
-                            );
-                            *count = 0; // Reset counter after inserting into map
+                            warn!("[!] [AUTO-BLOCK] IP {} exceeded packet threshold! Added to kernel BLOCKLIST.", ip);
                         }
                     }
                 }
@@ -187,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     signal::ctrl_c().await?;
-    info!("Exiting firewall...");
+    info!("Exiting...");
 
     Ok(())
 }

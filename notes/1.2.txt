@@ -1,35 +1,34 @@
-terms:
-    1) headers
-    2) trace pipe
-    3) arp
-    4) byte-shifting arrays
+libraries :
+    network-types: A crate containing low-level network protocol structure definitions (like EthHdr, Ipv4Hdr, TcpHdr) used to parse packets in no_std Rust.
 
-explainatons:
-    1) Headers are the metadata that describe the packet, including its source and destination IP addresses, protocol type, and other information.
-    2) Trace pipe is a mechanism for sending trace events from the kernel to user space.
-    3) ARP is the Address Resolution Protocol, used to map IP addresses to MAC addresses on a local network.
-    4) Byte-shifting arrays are used to extract specific fields from packet data by shifting and masking the data.
+terms :
+    1) Headers: Structured metadata prepended to packet payloads (e.g. Ethernet Header, IP Header) containing routing, protocol, and length information.
+    2) Trace Pipe: A debug file mechanism (`/sys/kernel/tracing/trace_pipe`) used to read kernel-space logs written via bpf_trace_printk or aya_log.
+    3) ARP: Address Resolution Protocol. Used to map IP addresses to MAC hardware addresses on a local network.
+    4) Byte-shifting arrays: Hand-written byte operations (shifting and masking) used to parse packet fields before structs like network-types were used.
 
-main :
-    We are going to start writing main.rs inside @ai-firewall-ebpf
-    now i will inspect incomming packets , parse their ethernet and ipv4 headers ,xtract their source ip and sprint it to the ebpf trace pipe (/sys/kernel/tracing/trace_pipe)
-    So  when the incoming packets hit the wlan0 eBPF/XDG gives us two memroy pointers inside the XdpContext struct
-        1) ctx.data() : a pointer to the start of the packet data
-        2) ctx.data_end() : a pointer to the end of the packet data
-    because a packacts is just a sequence of bytes , headers are just layered inside it.
-        1) ethernet header : size 14 bytes , contains mac addrress and tells us if the payload is a IPv4 , IPv6 , ARP or others.
-        2) ipv4 header : size ATLEAST 20 bytes , contains the source and destination ip address , protocol type , and other information.
-        3) tcp/udp header : size ATLEAST 20 bytes , port numbers and connection flags.
-        note: to keep it simple i did ipv4 for now i will extend this to ipv6 later
+explanation:
+    1) Headers encapsulate the packet payload at different network layers (Layer 2, Layer 3, Layer 4).
+    2) The trace pipe is an easy way to verify what the kernel eBPF program is doing without setting up maps.
+    3) ARP packets are layer 2 broadcasts. Currently, the firewall only intercepts and parses IPv4 headers, letting other types (like ARP) pass through automatically.
+    4) Hand-rolled byte-shifting is error-prone. Using a well-defined layout struct from the network-types crate is clean and verifier-safe.
 
-    Something very impoprt to know is that the linux kernal verifier to extremely strict . before letting your code run , it will check every single memeory access to ensure you will  never read out-of-bounds memory . for example if you try to  read 14 bytes into the packet data without explicitly proving to rust/eBPF that data + 14 <= data_end()  the kernel will reject your code for sure.
+main:
+    We implement packet dissection in 'ai-firewall-ebpf/src/main.rs'.
+    When a packet hits the network interface, eBPF provides two memory pointers:
+        1) ctx.data(): A pointer to the start of the raw packet bytes.
+        2) ctx.data_end(): A pointer to the end of the raw packet bytes.
 
-    > ADDING NETWORK  CRATE DEPENDENCIES
-        for making the parsing headers structs clean without manually writting byte-shifing arrays , we can use std low level netowkring definations from the network defination from the networkt-type  crate.
+    Packets are layered sequentially:
+        1) Ethernet Header (14 bytes): Contains source/destination MAC addresses and identifies the payload protocol (e.g. IPv4, IPv6, ARP).
+        2) IPv4 Header (minimum 20 bytes): Contains source/destination IP addresses, Layer 4 protocol (TCP/UDP), and packet length.
+        3) TCP/UDP Header: Contains source/destination port numbers and flags.
 
-        since we are using rust we got to write into the toml of @ai-firewall-edbpf and add network-types into the dependencies section.
+    Strict Kernel Verification:
+        The kernel verifier enforces memory safety. You cannot read or cast packet data without explicitly proving that the read fits within the packet boundaries:
+        e.g., 'start + EthHdr::LEN <= end' must be checked before accessing fields in the Ethernet header. Otherwise, the kernel throws a verification error and rejects the program.
 
-    wrote main.rs in @ai-firewall-edbpf/src/
-        #![no_std]: Kernel programs cannot use Rust's standard library (std) because there is no OS allocation runtime inside the eBPF sandboxed VM.
-        unsafe { &*(pointer as *const Struct) }: Reinterprets a raw byte array in memory as a structured format. It's marked unsafe because Rust cannot automatically verify raw hardware memory addresses—so we must handle the bounds checking manually beforehand.
-        u32::from_be(...): Network protocols communicate in Big Endian byte ordering (most significant byte first), whereas x86 CPUs read memory in Little Endian. from_be converts network bytes to standard CPU order.
+    Parsing Details:
+        - '#![no_std]': Required because eBPF runs inside a restricted virtual machine in the kernel with no OS standard library allocator.
+        - Pointer casting: Using 'unsafe { &*(pointer as *const Struct) }' lets us read raw packet bytes as typed structs.
+        - Endianness conversion: Network headers are formatted in Big Endian, while x86 CPUs are Little Endian. We translate values using 'u16::from_be()' or 'u32::from_be()' so they can be processed correctly by the CPU.

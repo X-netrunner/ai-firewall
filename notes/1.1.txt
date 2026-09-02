@@ -1,38 +1,33 @@
 libraries :
-    aya: A Rust library for eBPF development
-    tokio: A runtime for asynchronous Rust applications
-    Aya and Tokio are commonly paired in Rust to build high-performance, asynchronous eBPF applications. Aya is a pure-Rust library used to load and interact with eBPF programs inside the Linux kernel. Tokio acts as the asynchronous user-space runtime that manages data streams, logs, and system events sent from that kernel-space eBPF program
+    aya: A pure-Rust library for loading and interacting with eBPF programs inside the Linux kernel.
+    tokio: An asynchronous runtime for Rust used here as the userspace daemon's execution driver.
 
 terms :
-    1) eBPF: extended Berkeley Packet Filter
-    2) BPF: Berkeley Packet Filter
-    3) BPFEL: Berkeley Packet Filter Extension Language
-    4) BPF-linker: Berkeley Packet Filter Linker
-    5) XDP: eXpressive Data Path
+    1) eBPF: Extended Berkeley Packet Filter. A technology that allows running sandboxed code inside the Linux kernel without modifying the source or loading kernel modules.
+    2) BPF: Berkeley Packet Filter. The original, classic system eBPF was built upon (historically used for tcpdump).
+    3) BPFEL: BPF Extension Language (specifically, target 'bpfel-unknown-none' specifies a Little Endian eBPF bytecode target).
+    4) BPF-linker: A linker tool used to compile and package eBPF object files into ELF bytecode format.
+    5) XDP: eXpress Data Path. A kernel subsystem that allows executing eBPF programs directly at the network driver level.
 
 explanation:
-    1) eBPF is used for writing packet filtering programs that run in the kernel.
-    2) BPF is the underlying packet filtering mechanism that eBPF builds on. The main difference is that eBPF programs run in the kernel, while BPF programs run in user space. eBPF is used for security filtering and packet manipulation.
-    3) BPFEL is the extension language used to write eBPF programs.
-    4) BPF-linker is used to link eBPF programs with the kernel.
-    5) XDP: eXpressive Data Path is a Linux kernel subsystem that allows packet filtering at the network layer.
+    1) eBPF programs run entirely in the kernel space in a secure, sandboxed environment for high performance.
+    2) Classic BPF is a simplified precursor to eBPF. Both execute inside the kernel; however, eBPF is far more powerful, supporting system tracing, maps, helper functions, and JIT compilation.
+    3) BPFEL bytecode is compiled and loaded into the kernel using system calls.
+    4) BPF-linker is used to link eBPF programs with kernel-specific symbols.
+    5) XDP is used for low-latency network filtering before packets enter the standard TCP/IP stack.
 
 main:
-    okay so ai-firewall means an firewall which is capable of self healing and what not.
-    Usually we would settle on python for these kind of projects but i feel python would have been too heavy for this project hence i have settled on rust which is must faster and more efficient.
-    i can't make everything rely on llms or it would eat up my memory and a firewall should ideally be lightweight and efficient. hence i will set few basic rules , usr RL and llms for generating responses and making decisions.
-    I used aya and tokio to start my prject which is a cargo generate  which split my project into two distinct parts 1) kernel space and 2) user space.
-        1) the kernal space (ai-firewall-ebpf) : okay so for a firewall to work i would need to anaylise the network packkets before anything touches it hence i am going to make this rust program which runs in the kernel space , which would directly receive the packaets directly from the network driver  beforte the os stack even touchs it. btw this is a #![no_std] which means it does not depend on the standard library and can be compiled to run on bare metal.
-        2) the user space (ai-firewall) : This is a rust daemon that runs in the user space with sudo privileges and it job is to read the complied eBPF bytecode from disk , inject it  into the kernel , attack it to wlan0 and later manage AI rules and telemetry.
+    The AI-Firewall project is designed to be a lightweight, self-healing network firewall.
+    Instead of writing the entire firewall in a heavy scripting language like Python, we use Rust for its raw speed and efficiency.
+    To avoid excessive memory and latency overhead, we do not send every packet to an LLM. Instead, we use simple kernel-level filters and a userspace daemon that handles automatic rule injection.
+    
+    The project is split into two distinct environments:
+        1) Kernel-space (ai-firewall-ebpf): A '#![no_std]' Rust program attached to an XDP hook. It receives packets directly from the network driver before they reach the OS stack.
+        2) Userspace (ai-firewall): A daemon running with sudo privileges that loads the compiled eBPF ELF bytecode into the kernel, attaches it to a network interface (e.g. wlan0), and handles rules and telemetry.
 
-    Wwhat does this line mean ?
-        >> sudo ./target/debug/ai-firewall --iface wlan0
-        When you ran the binary with sudo:
-
-        System Call (bpf()): The userspace binary made a Linux system call (sys_bpf) to load the bytecode into the kernel.
-
-        Kernel Verifier: The Linux kernel verified the eBPF bytecode to guarantee it won't crash the kernel (checking for out-of-bounds memory access, infinite loops, etc.).
-
-        XDP Hooking: The program attached to the XDP (eXpress Data Path) hook on your wlan0 Wi-Fi driver.
-
-        Active Packet Processing: Right now, every incoming packet hitting your Wi-Fi interface passes through your ai_firewall eBPF function before Linux allocates memory for the packet in the TCP/IP stack. Currently, the function returns XDP_PASS, telling Linux: "This packet is fine, pass it along to the OS."
+    Executing the program:
+        $ sudo ./target/debug/ai-firewall --iface wlan0
+        When run, this triggers:
+        - A 'sys_bpf()' system call to load the bytecode.
+        - The Kernel Verifier, which inspects the code for safety (checks bounds, locks, infinite loops).
+        - XDP Hooking, which attaches the program to the interface. By default, it returns XDP_PASS, letting normal packets through.

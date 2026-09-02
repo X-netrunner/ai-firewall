@@ -1,0 +1,40 @@
+libraries :
+    std::time::Instant: A measurement of a monotonically non-decreasing clock used for duration calculations.
+    tokio::sync::Mutex (TokioMutex): A thread-safe mutual exclusion lock used to safely share states across async tasks.
+    std::sync::Arc: Atomically Reference Counted pointer. Allows sharing ownership of variables across multiple background tasks.
+
+terms :
+    1) TTL Sweeper: A background routine that periodically removes expired entries from a database or blocklist based on their time-to-live.
+    2) Mutex (Mutual Exclusion): A lock that ensures only one task/thread can write or read a shared data structure at a time, preventing data corruption.
+    3) Arc (Atomically Reference Counted): A smart pointer that tracks the number of references to a variable. When the count goes to zero, the variable is freed. Used to pass shared maps to threads safely.
+    4) Monotonic Clock: A clock that only goes forward (unlike wall-clock time, which can be modified or synced with NTP). Required for measuring time intervals accurately.
+
+explanation:
+    1) The TTL Sweeper ensures we do not block IPs forever, which avoids locking out legitimate users and prevents the eBPF BLOCKLIST map from running out of capacity.
+    2) Userspace tasks are running in parallel (the RingBuf reader and the Sweeper task). They both need to read and write to the 'BLOCKLIST' map and the timestamp tracker, so they must lock them with a Mutex before modifying.
+    3) In Rust, background tasks cannot borrow variables from the main thread because the compiler doesn't know if the main thread will exit first. Wrapping resources in 'Arc' extends their lifetime so they are shared safely.
+    4) We measure block durations by comparing 'Instant::now()' with the timestamp recorded when the block was initiated.
+
+main:
+    We add self-healing auto-unblocking logic in 'ai-firewall/src/main.rs'.
+        - Set 'BLOCK_TTL = Duration::from_secs(60)' (how long IPs stay blocked).
+        - Set 'CLEANUP_INTERVAL = Duration::from_secs(5)' (how often the sweeper runs).
+
+    State Tracking:
+        - We track block times with a userspace HashMap: 'blocked_timestamps' mapping IP (u32) to an 'Instant' (when it was blocked).
+        - Wrap both 'blocklist' and 'blocked_timestamps' in 'Arc<TokioMutex<...>>' so they can be accessed by both tasks.
+
+    Implementation of Tasks:
+        - Task A (Auto-Unblock Sweeper):
+          - Runs every 5 seconds.
+          - Locks 'blocked_timestamps' and checks for expired IPs ('now - added_at >= 60s').
+          - For each expired IP, calls 'blocklist.lock().await.remove(&ip)' and removes the IP from 'blocked_timestamps'.
+          - Logs: '[*] [TTL-EXPIRED] Unblocked IP ...'
+
+        - Task B (RingBuf Consumer & Auto-Blocker):
+          - Continues to read events from the ring buffer.
+          - When an IP exceeds 100 packets, locks the blocklist and timestamp tracker:
+            - Inserts the IP into the eBPF BLOCKLIST.
+            - Inserts 'Instant::now()' into 'blocked_timestamps'.
+            - Warns: '[!] [AUTO-BLOCK] IP ... added to BLOCKLIST for 60s.'
+            - Resets the local packet counter.
