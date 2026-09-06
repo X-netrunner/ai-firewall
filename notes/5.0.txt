@@ -1,0 +1,8 @@
+Okay so it has been a break in between so lets recap 
+
+lets continue 
+:
+	phase 2: implementation roadmap: ml and adaptive defence
+		step 1 :feature engineerring and window aggregation in userspace
+		step 2 :integrate ML inference (linfa framework)
+		step 3 :Dynamic Mitigation & Adaptive TTL Mechanism
