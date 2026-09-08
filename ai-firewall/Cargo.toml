@@ -7,7 +7,6 @@ license.workspace = true
 
 [dependencies]
 ai-firewall-common = { path = "../ai-firewall-common", features = ["user"] }
-
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
 aya-log = { workspace = true }

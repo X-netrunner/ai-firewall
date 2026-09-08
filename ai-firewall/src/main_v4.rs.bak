@@ -10,13 +10,14 @@ use aya::programs::{Xdp, XdpMode};
 use aya_log::EbpfLogger;
 use clap::Parser;
 use log::{debug, info, warn};
-use std::collections::{HashMap as StdHashMap, HashSet};
+use std::collections::HashMap as StdHashMap;
 use std::convert::TryFrom;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::Mutex as TokioMutex;
+
 
 const BLOCK_TTL: Duration = Duration::from_secs(60); // IPs stay blocked for 60 seconds
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(5); // Sweeper runs every 5 seconds
@@ -46,51 +47,6 @@ struct Opt {
     /// Include background mDNS (5353), SSDP (1900), and broadcast discovery noise in logs
     #[clap(long)]
     include_noise: bool,
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct WindowMetrics {
-    pub packet_count: u32,
-    pub unique_ports: HashSet<u16>,
-    pub tcp_count: u32,
-    pub udp_count: u32,
-    pub icmp_count: u32,
-    pub other_proto_count: u32,
-}
-
-#[derive(Debug, Clone)]
-pub struct FeatureVector {
-    pub ip: u32,
-    pub packet_rate: f64,
-    pub port_diversity: f64,
-    pub tcp_ratio: f64,
-    pub udp_ratio: f64,
-    pub icmp_ratio: f64,
-}
-
-impl WindowMetrics {
-    pub fn to_feature_vector(&self, ip: u32) -> FeatureVector {
-        let total = self.packet_count as f64;
-        if total == 0.0 {
-            return FeatureVector {
-                ip,
-                packet_rate: 0.0,
-                port_diversity: 0.0,
-                tcp_ratio: 0.0,
-                udp_ratio: 0.0,
-                icmp_ratio: 0.0,
-            };
-        }
-
-        FeatureVector {
-            ip,
-            packet_rate: total,
-            port_diversity: self.unique_ports.len() as f64,
-            tcp_ratio: (self.tcp_count as f64) / total,
-            udp_ratio: (self.udp_count as f64) / total,
-            icmp_ratio: (self.icmp_count as f64) / total,
-        }
-    }
 }
 
 #[tokio::main]
@@ -229,37 +185,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("[+] Auto-unblock TTL sweeper running (Block TTL: {}s, Interval: {}s)", BLOCK_TTL.as_secs(), CLEANUP_INTERVAL.as_secs());
 
     // -------------------------------------------------------------
-    // TASK B: RingBuf Event Collector & Window Aggregator
+    // TASK B: Consume RingBuf packet events
     // -------------------------------------------------------------
     if let Some(events_map) = ebpf.take_map("EVENTS") {
         let ring_buf = RingBuf::try_from(events_map)?;
         let mut async_fd = tokio::io::unix::AsyncFd::new(ring_buf)?;
-
-        // Channel to pass raw events from RingBuf ingestion loop to Feature Aggregator
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<PacketEvent>(10_000);
-
-        // 1. RingBuf Ingestion Task (Low Overhead Engine)
-        tokio::task::spawn(async move {
-            loop {
-                let mut guard = match async_fd.readable_mut().await {
-                    Ok(g) => g,
-                    Err(_) => break,
-                };
-                let ring_buf = guard.get_inner_mut();
-
-                while let Some(item) = ring_buf.next() {
-                    let data = item.as_ref();
-                    if data.len() < std::mem::size_of::<PacketEvent>() {
-                        continue;
-                    }
-                    let event = unsafe { *(data.as_ptr() as *const PacketEvent) };
-                    let _ = tx.try_send(event);
-                }
-                guard.clear_ready();
-            }
-        });
-
-        // 2. 1-Second Sliding Window Feature Aggregator Task
         let blocklist_clone = Arc::clone(&blocklist);
         let timestamps_clone = Arc::clone(&blocked_timestamps);
 
@@ -271,77 +201,74 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         tokio::task::spawn(async move {
-            let mut window_data: StdHashMap<u32, WindowMetrics> = StdHashMap::new();
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            let mut packet_counts: StdHashMap<u32, u32> = StdHashMap::new();
 
             loop {
-                tokio::select! {
-                    // Collect incoming packet telemetry
-                    Some(event) = rx.recv() => {
-                        // Noise Port Filter
-                        let is_noise_port = matches!(event.dst_port, 5353 | 1900 | 5355 | 137 | 138);
-                        if is_noise_port && !include_noise {
+                let mut guard = async_fd.readable_mut().await.unwrap();
+                let ring_buf = guard.get_inner_mut();
+
+                while let Some(item) = ring_buf.next() {
+                    let data = item.as_ref();
+                    if data.len() < std::mem::size_of::<PacketEvent>() {
+                        continue;
+                    }
+
+                    let event = unsafe { &*(data.as_ptr() as *const PacketEvent) };
+
+                    // Filter out multicast/discovery noise (mDNS 5353, SSDP 1900, LLMNR 5355, NetBIOS 137/138)
+                    let is_noise_port = matches!(event.dst_port, 5353 | 1900 | 5355 | 137 | 138);
+                    if is_noise_port && !include_noise {
+                        continue;
+                    }
+
+                    // Apply port filter if configured
+                    if let Some(target_p) = filter_port {
+                        if event.dst_port != target_p {
                             continue;
-                        }
-
-                        // Target Port Filter
-                        if let Some(target_p) = filter_port {
-                            if event.dst_port != target_p {
-                                continue;
-                            }
-                        }
-
-                        let metrics = window_data.entry(event.src_ip).or_default();
-                        metrics.packet_count += 1;
-                        metrics.unique_ports.insert(event.dst_port);
-                        match event.protocol {
-                            1 => metrics.icmp_count += 1,
-                            6 => metrics.tcp_count += 1,
-                            17 => metrics.udp_count += 1,
-                            _ => metrics.other_proto_count += 1,
                         }
                     }
 
-                    // 1-Second Interval Trigger (Evaluate Feature Vectors)
-                    _ = ticker.tick() => {
-                        if window_data.is_empty() {
-                            continue;
+                    let ip = Ipv4Addr::from(event.src_ip);
+                    let proto_str = match event.protocol {
+                        1 => "ICMP",
+                        6 => "TCP",
+                        17 => "UDP",
+                        _ => "OTHER",
+                    };
+
+                    let count = packet_counts.entry(event.src_ip).or_insert(0);
+                    *count += 1;
+
+                    // Log in verbose mode OR on first packet / milestones (every 25 packets)
+                    if verbose || *count == 1 || *count % 25 == 0 || *count >= threshold {
+                        info!(
+                            "[*] [EVENT] IP: {:15} | Port: {:5} | Proto: {:5} | Count: {}",
+                            ip, event.dst_port, proto_str, count
+                        );
+                    }
+
+                    // Threshold Auto-Block Rule
+                    if *count > threshold {
+                        let mut map = blocklist_clone.lock().await;
+                        let mut timestamps = timestamps_clone.lock().await;
+
+                        if map.insert(event.src_ip, 1, 0).is_ok() {
+                            timestamps.insert(event.src_ip, Instant::now());
+                            warn!(
+                                "[!] [AUTO-BLOCK] IP {} exceeded threshold of {} packets! Added to BLOCKLIST for {}s.",
+                                ip,
+                                threshold,
+                                BLOCK_TTL.as_secs()
+                            );
+                            *count = 0; // Reset counter after inserting into map
                         }
-
-                        for (&src_ip, metrics) in window_data.iter() {
-                            let fv = metrics.to_feature_vector(src_ip);
-                            let ip = Ipv4Addr::from(src_ip);
-
-                            if verbose || fv.packet_rate > 10.0 {
-                                info!(
-                                    "[*] [METRICS] IP: {:15} | Rate: {:4.0} pkts/s | Ports: {:2} | TCP: {:3.0}% | UDP: {:3.0}%",
-                                    ip, fv.packet_rate, fv.port_diversity, fv.tcp_ratio * 100.0, fv.udp_ratio * 100.0
-                                );
-                            }
-
-                            // Dynamic Rule Anomaly Trigger (Pre-ML placeholder rule)
-                            if fv.packet_rate > (threshold as f64) || fv.port_diversity > 15.0 {
-                                let mut map = blocklist_clone.lock().await;
-                                let mut timestamps = timestamps_clone.lock().await;
-
-                                if map.insert(src_ip, 1, 0).is_ok() {
-                                    timestamps.insert(src_ip, Instant::now());
-                                    warn!(
-                                        "[!] [AI-BLOCK] Anomaly detected on IP {}! Rate: {:.0} p/s, Ports: {}. Blocked for {}s.",
-                                        ip, fv.packet_rate, fv.port_diversity, BLOCK_TTL.as_secs()
-                                    );
-                                }
-                            }
-                        }
-
-                        // Reset feature metrics window for the next interval
-                        window_data.clear();
                     }
                 }
+
+                guard.clear_ready();
             }
         });
-
-        info!("[+] Feature Aggregator active (1-second sliding window).");
+        info!("[+] RingBuf event listener registered (Threshold: {} packets).", threshold);
     }
 
     info!("[+] AI Firewall is ACTIVE and monitoring '{}'. Press Ctrl+C to stop.", iface);
