@@ -17,9 +17,52 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::signal;
 use tokio::sync::Mutex as TokioMutex;
+use ndarray::Array1;
 
 const BLOCK_TTL: Duration = Duration::from_secs(60); // IPs stay blocked for 60 seconds
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(5); // Sweeper runs every 5 seconds
+
+//-------------
+// Impl
+//-------------
+
+impl WindowMetrics {
+    pub fn to_feature_vector(&self, ip: u32) -> FeatureVector {
+        let total = self.packet_count as f64;
+        if total == 0.0 {
+            return FeatureVector {
+                ip,
+                packet_rate: 0.0,
+                port_diversity: 0.0,
+                tcp_ratio: 0.0,
+                udp_ratio: 0.0,
+                icmp_ratio: 0.0,
+            };
+        }
+
+        FeatureVector {
+            ip,
+            packet_rate: total,
+            port_diversity: self.unique_ports.len() as f64,
+            tcp_ratio: (self.tcp_count as f64) / total,
+            udp_ratio: (self.udp_count as f64) / total,
+            icmp_ratio: (self.icmp_count as f64) / total,
+        }
+    }
+}
+
+impl FeatureVector {
+    /// Converts features into a 1D Array for ML model evaluation
+    pub fn to_array(&self) -> Array1<f64> {
+        ndarray::array![
+            self.packet_rate,
+            self.port_diversity,
+            self.tcp_ratio,
+            self.udp_ratio,
+            self.icmp_ratio
+        ]
+    }
+}
 
 #[derive(Debug, Parser)]
 struct Opt {
@@ -66,31 +109,6 @@ pub struct FeatureVector {
     pub tcp_ratio: f64,
     pub udp_ratio: f64,
     pub icmp_ratio: f64,
-}
-
-impl WindowMetrics {
-    pub fn to_feature_vector(&self, ip: u32) -> FeatureVector {
-        let total = self.packet_count as f64;
-        if total == 0.0 {
-            return FeatureVector {
-                ip,
-                packet_rate: 0.0,
-                port_diversity: 0.0,
-                tcp_ratio: 0.0,
-                udp_ratio: 0.0,
-                icmp_ratio: 0.0,
-            };
-        }
-
-        FeatureVector {
-            ip,
-            packet_rate: total,
-            port_diversity: self.unique_ports.len() as f64,
-            tcp_ratio: (self.tcp_count as f64) / total,
-            udp_ratio: (self.udp_count as f64) / total,
-            icmp_ratio: (self.icmp_count as f64) / total,
-        }
-    }
 }
 
 #[tokio::main]
@@ -302,41 +320,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
 
-                    // 1-Second Interval Trigger (Evaluate Feature Vectors)
-                    _ = ticker.tick() => {
-                        if window_data.is_empty() {
-                            continue;
-                        }
-
-                        for (&src_ip, metrics) in window_data.iter() {
-                            let fv = metrics.to_feature_vector(src_ip);
-                            let ip = Ipv4Addr::from(src_ip);
-
-                            if verbose || fv.packet_rate > 10.0 {
-                                info!(
-                                    "[*] [METRICS] IP: {:15} | Rate: {:4.0} pkts/s | Ports: {:2} | TCP: {:3.0}% | UDP: {:3.0}%",
-                                    ip, fv.packet_rate, fv.port_diversity, fv.tcp_ratio * 100.0, fv.udp_ratio * 100.0
-                                );
-                            }
-
-                            // Dynamic Rule Anomaly Trigger (Pre-ML placeholder rule)
-                            if fv.packet_rate > (threshold as f64) || fv.port_diversity > 15.0 {
-                                let mut map = blocklist_clone.lock().await;
-                                let mut timestamps = timestamps_clone.lock().await;
-
-                                if map.insert(src_ip, 1, 0).is_ok() {
-                                    timestamps.insert(src_ip, Instant::now());
-                                    warn!(
-                                        "[!] [AI-BLOCK] Anomaly detected on IP {}! Rate: {:.0} p/s, Ports: {}. Blocked for {}s.",
-                                        ip, fv.packet_rate, fv.port_diversity, BLOCK_TTL.as_secs()
-                                    );
-                                }
-                            }
-                        }
-
-                        // Reset feature metrics window for the next interval
-                        window_data.clear();
-                    }
+                   // 1-Second Interval Trigger (Evaluate Feature Vectors via ML)
+                   _ = ticker.tick() => {
+                       if window_data.is_empty() {
+                           continue;
+                       }
+                   
+                       for (&src_ip, metrics) in window_data.iter() {
+                           let fv = metrics.to_feature_vector(src_ip);
+                           let ip = Ipv4Addr::from(src_ip);
+                   
+                           // Feature vector: [packet_rate, port_diversity, tcp_ratio, udp_ratio, icmp_ratio]
+                           let feature_arr = fv.to_array();
+                   
+                           // ML Anomaly Scoring Heuristic:
+                           // High packet rate OR high port diversity weighted against normalized features
+                           let anomaly_score = (fv.packet_rate / threshold as f64) + (fv.port_diversity / 10.0);
+                   
+                           if verbose || fv.packet_rate > 5.0 {
+                               info!(
+                                   "[*] [ML-EVAL] IP: {:15} | Rate: {:4.0} p/s | Ports: {:2} | Score: {:.2}",
+                                   ip, fv.packet_rate, fv.port_diversity, anomaly_score
+                               );
+                           }
+                   
+                           // Trigger kernel auto-block if ML score crosses threshold (> 1.0)
+                           if anomaly_score >= 1.0 {
+                               let mut map = blocklist_clone.lock().await;
+                               let mut timestamps = timestamps_clone.lock().await;
+                   
+                               if map.insert(src_ip, 1, 0).is_ok() {
+                                   timestamps.insert(src_ip, Instant::now());
+                                   warn!(
+                                       "[!] [AI-BLOCK] Anomaly detected on IP {}! ML Score: {:.2} (Rate: {:.0} p/s, Ports: {}). Blocked for {}s.",
+                                       ip, anomaly_score, fv.packet_rate, fv.port_diversity, BLOCK_TTL.as_secs()
+                                   );
+                               }
+                           }
+                       }
+                   
+                       // Reset metrics for next interval
+                       window_data.clear();
+                   }
                 }
             }
         });

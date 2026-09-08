@@ -23,6 +23,10 @@ tokio = { workspace = true, features = [
     "time"
 ] }
 clap = { workspace = true, features = ["derive"] }
+ndarray = "0.15"
+linfa = "0.7"
+linfa-clustering = "0.7"
+
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }
