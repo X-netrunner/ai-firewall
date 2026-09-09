@@ -5,13 +5,16 @@
 #![no_std]
 
 #[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PacketEvent {
-    pub src_ip: u32,
-    pub dst_port: u16,
-    pub protocol: u8,
-    pub _pad: u8, // Memory padding to align struct to 4 bytes
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KernelMetrics {
+	pub packet_count: u64,
+	pub bytes_count: u64,
+	pub tcp_count: u32,
+	pub udp_count: u32,
+	pub icmp_count: u32,
+	pub syn_count: u32,
+	pub last_seen_ts: u64,
 }
 
 #[cfg(feature = "user")]
-unsafe impl aya::Pod for PacketEvent {}
+unsafe impl aya::Pod for KernelMetrics {}
