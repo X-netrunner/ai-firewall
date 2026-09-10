@@ -1,6 +1,6 @@
 //---------------------------
 // 1.3 || 3.1 || 3.2 || 4.1 || 5.1
-// Userspace eBPF Firewall Controller with TUI Dashboard
+// Userspace eBPF Firewall Controller with Interactive TUI & File Exporter
 //---------------------------
 
 use ai_firewall_common::KernelMetrics;
@@ -24,14 +24,46 @@ use ratatui::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap as StdHashMap;
 use std::convert::TryFrom;
-use std::io;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::net::Ipv4Addr;
+use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex as TokioMutex;
 
 const BLOCK_TTL: Duration = Duration::from_secs(60);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(1);
+const LOG_FILE_PATH: &str = "alerts.json";
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct AlertLog {
+    pub timestamp: u64,
+    pub event_type: String,
+    pub ip: String,
+    pub packet_rate: Option<f64>,
+    pub bytes_rate: Option<f64>,
+}
+
+fn log_alert_to_file(alert: AlertLog) {
+    if let Ok(json_str) = serde_json::to_string(&alert) {
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(LOG_FILE_PATH)
+        {
+            let _ = writeln!(file, "{}", json_str);
+            let _ = file.flush();
+        }
+    }
+}
+
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ModelConfig {
@@ -73,6 +105,13 @@ struct Opt {
     threshold: u32,
 }
 
+#[derive(PartialEq)]
+enum InputMode {
+    Normal,
+    ManualBlock,
+    ManualUnblock,
+}
+
 #[derive(Default, Clone)]
 struct DashboardState {
     pub active_ips: Vec<(String, u64, u64, bool)>, // (IP, Packets, Bytes, Anomaly)
@@ -80,10 +119,23 @@ struct DashboardState {
     pub total_bytes: u64,
     pub blocked_ips: Vec<(String, u64)>,           // (IP, TTL remaining seconds)
     pub logs: Vec<String>,
+    pub paused: bool,
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() {
+    if let Err(e) = firewall_main().await {
+        let _ = disable_raw_mode();
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, LeaveAlternateScreen);
+        let _ = stdout.flush();
+        eprintln!("[!] AI Firewall failed: {e:?}");
+        eprintln!("    Hint: run with `-i <iface>` for the right interface (e.g. `-i lo`, `-i eth0`).");
+        std::process::exit(1);
+    }
+}
+
+async fn firewall_main() -> Result<(), Box<dyn std::error::Error>> {
     let opt = Opt::parse();
 
     // 1. Bump memory lock limit
@@ -101,24 +153,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 3. Initialize eBPF Logger
     if let Err(e) = EbpfLogger::init(&mut ebpf) {
-    	eprintln!("[!] Warning: Failed to initialize eBPF logger: {}",e);
+        eprintln!("[!] Warning: Failed to initialize eBPF logger: {}", e);
     }
 
     // 4. Attach XDP program
     let Opt { iface, skb, threshold } = opt;
-    let program: &mut Xdp = ebpf.program_mut("ai_firewall").unwrap().try_into()?;
+    let program: &mut Xdp = ebpf
+        .program_mut("ai_firewall")
+        .context("[!] eBPF program 'ai_firewall' not found in image")?
+        .try_into()?;
     program.load()?;
 
+    let mut attached_mode = "XDP (native)";
     if skb {
         program.attach(&iface, XdpMode::Skb)?;
-    } else {
-        if program.attach(&iface, XdpMode::default()).is_err() {
-            program.attach(&iface, XdpMode::Skb)?;
-        }
+        attached_mode = "XDP (generic/SKB)";
+    } else if program.attach(&iface, XdpMode::default()).is_err() {
+        eprintln!("[!] Native XDP not available on '{iface}', falling back to generic (SKB) XDP mode.");
+        program.attach(&iface, XdpMode::Skb)?;
+        attached_mode = "XDP (generic/SKB)";
     }
 
     // 5. Shared state between kernel sweeper and TUI render engine
-    let blocklist_map = ebpf.take_map("BLOCKLIST").context("failed to find BLOCKLIST map")?;
+    let blocklist_map = ebpf.take_map("BLOCKLIST").context("[!] failed to find BLOCKLIST map")?;
     let blocklist: HashMap<_, u32, u32> = HashMap::try_from(blocklist_map)?;
     let blocklist = Arc::new(TokioMutex::new(blocklist));
 
@@ -126,6 +183,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(TokioMutex::new(StdHashMap::new()));
 
     let dashboard_state = Arc::new(TokioMutex::new(DashboardState::default()));
+
+    dashboard_state.lock().await.logs.push(format!(
+        "[*] AI Firewall attached to '{}' in {} mode. Waiting for traffic...",
+        iface, attached_mode
+    ));
 
     // Load pre-trained ML model
     let model_config: Option<ModelConfig> = std::fs::read_to_string("model.json")
@@ -146,36 +208,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             interval.tick().await;
 
             let now = Instant::now();
-            let mut timestamps = timestamps_cleaner.lock().await;
 
-            let expired_ips: Vec<u32> = timestamps
-                .iter()
-                .filter(|(_, added_at)| now.duration_since(**added_at) >= BLOCK_TTL)
-                .map(|(&ip, _)| ip)
-                .collect();
+            // Phase 1: snapshot expired IPs (lock only what we need)
+            let expired_ips: Vec<u32> = {
+                let timestamps = timestamps_cleaner.lock().await;
+                timestamps
+                    .iter()
+                    .filter(|(_, added_at)| now.duration_since(**added_at) >= BLOCK_TTL)
+                    .map(|(&ip, _)| ip)
+                    .collect()
+            };
 
             if !expired_ips.is_empty() {
+                // Phase 2: consistent lock order (blocklist -> timestamps -> dashboard)
                 let mut map = blocklist_cleaner.lock().await;
+                let mut timestamps = timestamps_cleaner.lock().await;
                 let mut dash = dashboard_cleaner.lock().await;
 
                 for ip in expired_ips {
                     if map.remove(&ip).is_ok() {
                         timestamps.remove(&ip);
-                        dash.logs.push(format!("[TTL-EXPIRED] Unblocked IP {}", Ipv4Addr::from(ip)));
+                        let ip_str = Ipv4Addr::from(ip).to_string();
+                        dash.logs.push(format!("[*] [TTL-EXPIRED] Unblocked IP {}", ip_str));
+
+                        log_alert_to_file(AlertLog {
+                            timestamp: current_timestamp(),
+                            event_type: "TTL-EXPIRED".to_string(),
+                            ip: ip_str,
+                            packet_rate: None,
+                            bytes_rate: None,
+                        });
                     }
                 }
             }
 
-            // Update remaining TTL display list for active blocks
+            // Phase 3: refresh TTL display (timestamps -> dashboard, no blocklist)
+            let remaining_ips: Vec<(String, u64)> = {
+                let timestamps = timestamps_cleaner.lock().await;
+                timestamps
+                    .iter()
+                    .map(|(&ip, &added_at)| {
+                        let elapsed = now.duration_since(added_at).as_secs();
+                        let remaining = BLOCK_TTL.as_secs().saturating_sub(elapsed);
+                        (Ipv4Addr::from(ip).to_string(), remaining)
+                    })
+                    .collect()
+            };
+
             let mut dash = dashboard_cleaner.lock().await;
-            dash.blocked_ips = timestamps
-                .iter()
-                .map(|(&ip, &added_at)| {
-                    let elapsed = now.duration_since(added_at).as_secs();
-                    let remaining = BLOCK_TTL.as_secs().saturating_sub(elapsed);
-                    (Ipv4Addr::from(ip).to_string(), remaining)
-                })
-                .collect();
+            dash.blocked_ips = remaining_ips;
 
             if dash.logs.len() > 100 {
                 dash.logs.drain(0..50);
@@ -186,7 +267,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // -------------------------------------------------------------
     // TASK B: Kernel Map Sweeper and ML Evaluator Loop
     // -------------------------------------------------------------
-    let metrics_map = ebpf.take_map("METRICS_MAP").context("failed to find METRICS_MAP")?;
+    let metrics_map = ebpf.take_map("METRICS_MAP").context("[!] failed to find METRICS_MAP")?;
     let mut metrics_map: HashMap<_, u32, KernelMetrics> = HashMap::try_from(metrics_map)?;
 
     let blocklist_clone = Arc::clone(&blocklist);
@@ -208,6 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for src_ip in keys {
                 if let Ok(metrics) = metrics_map.get(&src_ip, 0) {
                     let packet_rate = metrics.packet_count as f64;
+                    let bytes_rate = metrics.bytes_count as f64;
                     let total = packet_rate.max(1.0);
 
                     total_p += metrics.packet_count;
@@ -215,7 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let feature_arr = [
                         packet_rate,
-                        (metrics.bytes_count as f64) / total,
+                        bytes_rate / total,
                         (metrics.tcp_count as f64) / total,
                         (metrics.udp_count as f64) / total,
                         (metrics.icmp_count as f64) / total,
@@ -227,8 +309,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         packet_rate > threshold as f64
                     };
 
+                    let ip_str = Ipv4Addr::from(src_ip).to_string();
+
                     current_active.push((
-                        Ipv4Addr::from(src_ip).to_string(),
+                        ip_str.clone(),
                         metrics.packet_count,
                         metrics.bytes_count,
                         is_anomaly,
@@ -241,12 +325,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if map.insert(src_ip, 1, 0).is_ok() {
                             timestamps.insert(src_ip, Instant::now());
                             let mut dash = dashboard_clone.lock().await;
-                            dash.logs.push(format!(
-                                "[AI-BLOCK] Blocked IP {} ({:.0} p/s) for {}s",
-                                Ipv4Addr::from(src_ip),
-                                packet_rate,
-                                BLOCK_TTL.as_secs()
-                            ));
+                            if !dash.paused {
+                                dash.logs.push(format!(
+                                    "[*] [AI-BLOCK] Blocked IP {} ({:.0} p/s) for {}s",
+                                    ip_str,
+                                    packet_rate,
+                                    BLOCK_TTL.as_secs()
+                                ));
+                            }
+
+                            log_alert_to_file(AlertLog {
+                                timestamp: current_timestamp(),
+                                event_type: "AI-BLOCK".to_string(),
+                                ip: ip_str,
+                                packet_rate: Some(packet_rate),
+                                bytes_rate: Some(bytes_rate),
+                            });
                         }
                     }
 
@@ -262,13 +356,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     // -------------------------------------------------------------
-    // TASK C: TUI Render Engine (Crossterm & Ratatui)
+    // TASK C: Interactive TUI Render Engine (Crossterm & Ratatui)
     // -------------------------------------------------------------
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
+
+    let mut input_mode = InputMode::Normal;
+    let mut input_buffer = String::new();
 
     loop {
         let state = dashboard_state.lock().await.clone();
@@ -279,31 +376,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .margin(1)
                 .constraints(
                     [
-                        Constraint::Length(3),  // Header stats
-                        Constraint::Percentage(50), // Active traffic & blocklist table
-                        Constraint::Percentage(40), // Logs panel
+                        Constraint::Length(3),
+                        Constraint::Length(3),
+                        Constraint::Percentage(45),
+                        Constraint::Percentage(35),
                     ]
                     .as_ref(),
                 )
                 .split(f.size());
 
-            // Header Banner
             let header_text = format!(
-                " Interface: {} | Mode: XDP | Total Packets: {} | Total Bytes: {} KB | (Press 'q' to exit)",
-                iface, state.total_packets, state.total_bytes / 1024
+                " Interface: {} | Mode: XDP | Total Packets: {} | Total Bytes: {} KB | Feed: {}",
+                iface,
+                state.total_packets,
+                state.total_bytes / 1024,
+                if state.paused { "PAUSED" } else { "LIVE" }
             );
             let header = Paragraph::new(header_text)
                 .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
                 .block(Block::default().borders(Borders::ALL).title(" AI Firewall Status "));
             f.render_widget(header, chunks[0]);
 
-            // Middle Layout Split: Active IP Table vs Blocklist
+            let prompt_widget = match input_mode {
+                InputMode::Normal => Paragraph::new(
+                    " [B] Manual Block IP  |  [U] Manual Unblock IP  |  [P] Pause/Resume Feed  |  [Q] Quit"
+                )
+                .style(Style::default().fg(Color::Yellow))
+                .block(Block::default().borders(Borders::ALL).title(" Controls ")),
+
+                InputMode::ManualBlock => Paragraph::new(format!("Enter IP to BLOCK: {}", input_buffer))
+                    .style(Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+                    .block(Block::default().borders(Borders::ALL).title(" Action: Manual Block (Press Enter to Apply, Esc to Cancel) ")),
+
+                InputMode::ManualUnblock => Paragraph::new(format!("Enter IP to UNBLOCK: {}", input_buffer))
+                    .style(Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+                    .block(Block::default().borders(Borders::ALL).title(" Action: Manual Unblock (Press Enter to Apply, Esc to Cancel) ")),
+            };
+            f.render_widget(prompt_widget, chunks[1]);
+
             let mid_chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(60), Constraint::Percentage(40)].as_ref())
-                .split(chunks[1]);
+                .split(chunks[2]);
 
-            // Active Traffic Table
             let rows: Vec<Row> = state
                 .active_ips
                 .iter()
@@ -339,7 +454,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .block(Block::default().borders(Borders::ALL).title(" Live Monitored Traffic "));
             f.render_widget(active_table, mid_chunks[0]);
 
-            // Blocklist Table
             let block_rows: Vec<Row> = state
                 .blocked_ips
                 .iter()
@@ -360,7 +474,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .block(Block::default().borders(Borders::ALL).title(" Kernel Blocklist Map "));
             f.render_widget(block_table, mid_chunks[1]);
 
-            // Logs Panel
             let log_items: Vec<ListItem> = state
                 .logs
                 .iter()
@@ -370,20 +483,106 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .collect();
             let logs_list = List::new(log_items)
                 .block(Block::default().borders(Borders::ALL).title(" System & ML Events "));
-            f.render_widget(logs_list, chunks[2]);
+            f.render_widget(logs_list, chunks[3]);
         })?;
 
-        // Non-blocking exit key listener
+        // -------------------------------------------------------------
+        // TASK D: Key Event Handler
+        // -------------------------------------------------------------
         if event::poll(Duration::from_millis(100))? {
             if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Char('q') || key.code == KeyCode::Char('Q') {
-                    break;
+                match input_mode {
+                    InputMode::Normal => match key.code {
+                        KeyCode::Char('q') | KeyCode::Char('Q') => break,
+                        KeyCode::Char('b') | KeyCode::Char('B') => {
+                            input_mode = InputMode::ManualBlock;
+                            input_buffer.clear();
+                        }
+                        KeyCode::Char('u') | KeyCode::Char('U') => {
+                            input_mode = InputMode::ManualUnblock;
+                            input_buffer.clear();
+                        }
+                        KeyCode::Char('p') | KeyCode::Char('P') => {
+                            let mut dash = dashboard_state.lock().await;
+                            dash.paused = !dash.paused;
+                        }
+                        _ => {}
+                    },
+
+                    InputMode::ManualBlock => match key.code {
+                        KeyCode::Enter => {
+                            if let Ok(ip) = Ipv4Addr::from_str(&input_buffer) {
+                                let ip_u32 = u32::from(ip);
+                                let mut map = blocklist.lock().await;
+                                let mut timestamps = blocked_timestamps.lock().await;
+
+                                if map.insert(ip_u32, 1, 0).is_ok() {
+                                    timestamps.insert(ip_u32, Instant::now());
+                                    let mut dash = dashboard_state.lock().await;
+                                    dash.logs.push(format!("[*] [MANUAL-BLOCK] Manually blocked IP {}", ip));
+
+                                    log_alert_to_file(AlertLog {
+                                        timestamp: current_timestamp(),
+                                        event_type: "MANUAL-BLOCK".to_string(),
+                                        ip: ip.to_string(),
+                                        packet_rate: None,
+                                        bytes_rate: None,
+                                    });
+                                }
+                            }
+                            input_mode = InputMode::Normal;
+                        }
+                        KeyCode::Esc => {
+                            input_mode = InputMode::Normal;
+                        }
+                        KeyCode::Char(c) => {
+                            input_buffer.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            input_buffer.pop();
+                        }
+                        _ => {}
+                    },
+
+                    InputMode::ManualUnblock => match key.code {
+                        KeyCode::Enter => {
+                            if let Ok(ip) = Ipv4Addr::from_str(&input_buffer) {
+                                let ip_u32 = u32::from(ip);
+                                let mut map = blocklist.lock().await;
+                                let mut timestamps = blocked_timestamps.lock().await;
+
+                                if map.remove(&ip_u32).is_ok() {
+                                    timestamps.remove(&ip_u32);
+                                    let mut dash = dashboard_state.lock().await;
+                                    dash.logs.push(format!("[*] [MANUAL-UNBLOCK] Manually unblocked IP {}", ip));
+
+                                    log_alert_to_file(AlertLog {
+                                        timestamp: current_timestamp(),
+                                        event_type: "MANUAL-UNBLOCK".to_string(),
+                                        ip: ip.to_string(),
+                                        packet_rate: None,
+                                        bytes_rate: None,
+                                    });
+                                }
+                            }
+                            input_mode = InputMode::Normal;
+                        }
+                        KeyCode::Esc => {
+                            input_mode = InputMode::Normal;
+                        }
+                        KeyCode::Char(c) => {
+                            input_buffer.push(c);
+                        }
+                        KeyCode::Backspace => {
+                            input_buffer.pop();
+                        }
+                        _ => {}
+                    },
                 }
             }
         }
     }
 
-    // Cleanup TUI terminal state upon quit
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;

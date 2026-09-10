@@ -9,7 +9,7 @@ fn main() -> anyhow::Result<()> {
     let ebpf_package = packages
         .into_iter()
         .find(|cargo_metadata::Package { name, .. }| name.as_str() == "ai-firewall-ebpf")
-        .ok_or_else(|| anyhow!("ai-firewall-ebpf package not found"))?;
+        .ok_or_else(|| anyhow!("[!] ai-firewall-ebpf package not found"))?;
     let cargo_metadata::Package {
         name,
         manifest_path,
@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
         name: name.as_str(),
         root_dir: manifest_path
             .parent()
-            .ok_or_else(|| anyhow!("no parent for {manifest_path}"))?
+            .ok_or_else(|| anyhow!("[!] no parent for {manifest_path}"))?
             .as_str(),
         ..Default::default()
     };
