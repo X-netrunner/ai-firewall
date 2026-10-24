@@ -1,40 +1,162 @@
 libraries :
-    std::time::Instant: A measurement of a monotonically non-decreasing clock used for duration calculations.
-    tokio::sync::Mutex (TokioMutex): A thread-safe mutual exclusion lock used to safely share states across async tasks.
-    std::sync::Arc: Atomically Reference Counted pointer. Allows sharing ownership of variables across multiple background tasks.
 
 terms :
-    1) TTL Sweeper: A background routine that periodically removes expired entries from a database or blocklist based on their time-to-live.
-    2) Mutex (Mutual Exclusion): A lock that ensures only one task/thread can write or read a shared data structure at a time, preventing data corruption.
-    3) Arc (Atomically Reference Counted): A smart pointer that tracks the number of references to a variable. When the count goes to zero, the variable is freed. Used to pass shared maps to threads safely.
-    4) Monotonic Clock: A clock that only goes forward (unlike wall-clock time, which can be modified or synced with NTP). Required for measuring time intervals accurately.
 
 explanation:
-    1) The TTL Sweeper ensures we do not block IPs forever, which avoids locking out legitimate users and prevents the eBPF BLOCKLIST map from running out of capacity.
-    2) Userspace tasks are running in parallel (the RingBuf reader and the Sweeper task). They both need to read and write to the 'BLOCKLIST' map and the timestamp tracker, so they must lock them with a Mutex before modifying.
-    3) In Rust, background tasks cannot borrow variables from the main thread because the compiler doesn't know if the main thread will exit first. Wrapping resources in 'Arc' extends their lifetime so they are shared safely.
-    4) We measure block durations by comparing 'Instant::now()' with the timestamp recorded when the block was initiated.
 
 main:
-    We add self-healing auto-unblocking logic in 'ai-firewall/src/main.rs'.
-        - Set 'BLOCK_TTL = Duration::from_secs(60)' (how long IPs stay blocked).
-        - Set 'CLEANUP_INTERVAL = Duration::from_secs(5)' (how often the sweeper runs).
+    2,3c2
+< // 1.3 || 3.1 || 3.2 || 4.1
+< // Userspace eBPF Firewall Controller
+---
+> // 1.3 || 3.1 || 3.2
+17d15
+< use std::time::{Duration, Instant};
+21,23d18
+< const BLOCK_TTL: Duration = Duration::from_secs(60); // IPs stay blocked for 60 seconds
+< const CLEANUP_INTERVAL: Duration = Duration::from_secs(5); // Sweeper runs every 5 seconds
+<
+26d20
+<    /// Interface to attach XDP to (e.g. lo, wlan0, eth0)
+38c32
+<     // 2. Bump the memlock rlimit (needed for kernel memory allocation)
+---
+>     // 2. Bump the memlock rlimit (needed for older kernel memory accounting)
+72c66
+<     // 5. Attach XDP program dynamically based on CLI input
+---
+>     // 5. Attach XDP program to network interface
+78c72
+<         .context(format!("[!] failed to attach XDP program to {iface}"))?;
+---
+>         .context("[!] failed to attach the XDP program with default mode - try changing XdpMode::default() to XdpMode::Skb")?;
+80c74
+<     info!("[*] AI Firewall attached to interface '{iface}'. Waiting for events...");
+---
+>     info!("[*] AI Firewall attached to {iface}. Waiting for Ctrl-C...");
+82c76
+<     // 6. Access eBPF BLOCKLIST map
+---
+>     // 6. Populating the ebpf blocklist map from userspace using `take_map` (owns the map)
+89,129c83,89
+<     // Shared in-memory tracker for block timestamps: IP (u32 Network Byte Order) -> Instant
+<     let blocked_timestamps: Arc<TokioMutex<StdHashMap<u32, Instant>>> =
+<         Arc::new(TokioMutex::new(StdHashMap::new()));
+<
+<     // -------------------------------------------------------------
+<     // TASK A: Auto-Unblock Cleanup Loop (TTL Sweeper)
+<     // -------------------------------------------------------------
+<     let blocklist_cleaner = Arc::clone(&blocklist);
+<     let timestamps_cleaner = Arc::clone(&blocked_timestamps);
+<
+<     tokio::task::spawn(async move {
+<         let mut interval = tokio::time::interval(CLEANUP_INTERVAL);
+<         loop {
+<             interval.tick().await;
+<
+<             let now = Instant::now();
+<             let mut timestamps = timestamps_cleaner.lock().await;
+<
+<             // Find all IPs that have passed the TTL threshold
+<             let expired_ips: Vec<u32> = timestamps
+<                 .iter()
+<                 .filter(|(_, added_at)| now.duration_since(**added_at) >= BLOCK_TTL)
+<                 .map(|(&ip, _)| ip)
+<                 .collect();
+<
+<             if !expired_ips.is_empty() {
+<                 let mut map = blocklist_cleaner.lock().await;
+<
+<                 // Remove expired IPs from eBPF map and internal tracker
+<                 for ip in expired_ips {
+<                     if map.remove(&ip).is_ok() {
+<                         timestamps.remove(&ip);
+<                         info!(
+<                             "[*] [TTL-EXPIRED] Unblocked IP {} from eBPF BLOCKLIST.",
+<                             Ipv4Addr::from(u32::from_be(ip))
+<                         );
+<                     }
+<                 }
+<             }
+<         }
+<     });
+---
+>     // Blocking 8.8.8.8
+>     let block_ip: Ipv4Addr = "8.8.8.8".parse()?;
+>     let ip_u32 = u32::from(block_ip); // Converts IP to native u32 format
+>
+>     // Write IP into the eBPF map shared with kernel space ( key : IP , value : 1 flag)
+>     blocklist.lock().await.insert(ip_u32, 1, 0)?;
+>     info!("[*] Successfully added {} (u32: {}) to eBPF BLOCKLIST map!", block_ip, ip_u32);
+131,133c91
+<     // -------------------------------------------------------------
+<     // TASK B: Consume RingBuf packet events
+<     // -------------------------------------------------------------
+---
+>     // 7. Consume binary RingBuf packet events using `take_map`
+138d95
+<         let timestamps_clone = Arc::clone(&blocked_timestamps);
+154,157c111
+<
+<                     // Convert network byte order to host byte order for readable display
+<                     let src_ip_host = u32::from_be(event.src_ip);
+<                     let ip = Ipv4Addr::from(src_ip_host);
+---
+>                     let ip = Ipv4Addr::from(event.src_ip);
+167d120
+<                     // Threshold Auto-Block Rule (>100 packets)
+170,171d122
+<                         let mut timestamps = timestamps_clone.lock().await;
+<
+173,179c124
+<                             timestamps.insert(event.src_ip, Instant::now());
+<                             warn!(
+<                                 "[!] [AUTO-BLOCK] IP {} exceeded packet threshold! Added to BLOCKLIST for {}s.",
+<                                 ip,
+<                                 BLOCK_TTL.as_secs()
+<                             );
+<                             *count = 0; // Reset counter after inserting into map
+---
+>                             warn!("[!] [AUTO-BLOCK] IP {} exceeded packet threshold! Added to kernel BLOCKLIST.", ip);
+190c135
+<     info!("Exiting firewall...");
+---
+>     info!("Exiting...");
 
-    State Tracking:
-        - We track block times with a userspace HashMap: 'blocked_timestamps' mapping IP (u32) to an 'Instant' (when it was blocked).
-        - Wrap both 'blocklist' and 'blocked_timestamps' in 'Arc<TokioMutex<...>>' so they can be accessed by both tasks.
+    i am too lazy to type fuck you
+    Here is the breakdown of your eBPF kernel-space (`XDP`) code diff matching the exact style and formatting of the previous userspace explanation:
 
-    Implementation of Tasks:
-        - Task A (Auto-Unblock Sweeper):
-          - Runs every 5 seconds.
-          - Locks 'blocked_timestamps' and checks for expired IPs ('now - added_at >= 60s').
-          - For each expired IP, calls 'blocklist.lock().await.remove(&ip)' and removes the IP from 'blocked_timestamps'.
-          - Logs: '[*] [TTL-EXPIRED] Unblocked IP ...'
+---
 
-        - Task B (RingBuf Consumer & Auto-Blocker):
-          - Continues to read events from the ring buffer.
-          - When an IP exceeds 100 packets, locks the blocklist and timestamp tracker:
-            - Inserts the IP into the eBPF BLOCKLIST.
-            - Inserts 'Instant::now()' into 'blocked_timestamps'.
-            - Warns: '[!] [AUTO-BLOCK] IP ... added to BLOCKLIST for 60s.'
-            - Resets the local packet counter.
+### Key Structural & Logic Differences
+
+#### 1. Removal of Event Telemetry (`RingBuf` & `PacketEvent`)
+
+* **Previous (`<`)**: Included `RingBuf` and `PacketEvent` imports from `aya_ebpf::maps` and common types. This allowed kernel-space XDP to serialize network metadata (Source IP, Destination Port, Protocol) and push live packet events up to userspace.
+* **Current (`>`)**: Removed `RingBuf` and `PacketEvent` references. The kernel code no longer packages network telemetry to stream to userspace.
+
+#### 2. eBPF Ring Buffer Map Allocation
+
+* **Previous (`<`)**: Defined a static kernel ring buffer map (`static EVENTS: RingBuf`) allocated with a 16MB ring size (`16777216` bytes) to buffer event data.
+* **Current (`>`)**: Completely deleted the `EVENTS` map declaration, conserving kernel memory space.
+
+#### 3. Packet Header Metadata Extraction
+
+* **Previous (`<`)**: Extracted and maintained variables for `src_addr`, initialized `dst_port = 0`, and saved the transport layer protocol into dedicated variables for later use in the event payload.
+* **Current (`>`)**: Removed these intermediate variable extractions since event submission was removed.
+
+#### 4. Trace Logging & Event Reservation (`EVENTS.reserve` / `EVENTS.submit`)
+
+* **Previous (`<`)**: Reserved slot memory on the ring buffer via `EVENTS.reserve::<PacketEvent>(0)`, populated the payload with IP/port/protocol fields, and committed it via `entry.submit(0)`. Trace logging was disabled (`//info!(&ctx, "received a packet")`).
+* **Current (`>`)**: Stripped the ring buffer reservation/submission logic entirely and re-enabled immediate kernel trace logging (`info!(&ctx, "received a packet")`).
+
+---
+
+### Summary Table
+
+| Feature | Previous Version (`<`) | Current Version (`>`) |
+| --- | --- | --- |
+| **Telemetry System** | Active `RingBuf` streaming to pass packet events to userspace. | Disabled `RingBuf` streaming (runs purely in-kernel). |
+| **Allocated eBPF Maps** | `HashMap` (Blocklist) + `RingBuf` (`EVENTS`, 16MB). | `HashMap` (Blocklist) only. |
+| **Metadata Extraction** | Extracted `src_ip`, `dst_port`, and `proto` into variables. | Removed unnecessary metadata extraction variables. |
+| **Kernel Trace Logger** | Disabled/Commented out (`//info!...`). | Active trace logging enabled (`info!...`). |

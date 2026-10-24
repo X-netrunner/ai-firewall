@@ -9,7 +9,7 @@ license.workspace = true
 ai-firewall-common = { path = "../ai-firewall-common", features = ["user"] }
 anyhow = { workspace = true, default-features = true }
 aya = { workspace = true }
-aya-log = { workspace = true }
+
 env_logger = { workspace = true }
 libc = { workspace = true }
 log = { workspace = true }
@@ -22,15 +22,11 @@ tokio = { workspace = true, features = [
     "sync",
     "time"
 ] }
-clap = { workspace = true, features = ["derive"] }
-ndarray = "0.15"
-linfa = "0.7"
-linfa-clustering = "0.7"
-serde = { version = "1.0" , features = ["derive"] }
-serde_json = "1.0"
-ratatui ="0.26"
-crossterm="0.27"
-
+clap = { workspace = true, features = ["derive", "usage", "error-context"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+toml = "0.8"
+ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
 [build-dependencies]
 anyhow = { workspace = true }
 aya-build = { workspace = true }

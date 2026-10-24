@@ -20,15 +20,108 @@ main:
         - Added '_pad: u8' to ensure the struct aligns to a 4-byte boundary.
         - Total size of PacketEvent: src_ip (4 bytes) + dst_port (2 bytes) + protocol (1 byte) + pad (1 byte) = 8 bytes.
 
-    Streaming from Kernel:
-        - Allocate a static 'EVENTS' RingBuf map in 'ai-firewall-ebpf/src/main.rs' with 16MB of capacity.
-        - In 'try_ai_firewall()', we query 'EVENTS.reserve::<PacketEvent>(0)'.
-        - If successful, write the 'PacketEvent' struct (source IP, destination port, protocol) and call 'entry.submit(0)'.
+        2c2
+        < // 1.2 || 2.1 || 3.2
+        ---
+        > // 1.2 || 2.1
+        8d7 >-- including HashMap , RingBuf
+        < use ai_firewall_common::PacketEvent;
+        12,13c11,12
+        < 	maps::{HashMap, RingBuf},
+        < 	programs::XdpContext,
+        ---
+        > 	maps::HashMap,
+        > 	programs::XdpContext
+        29,31d27 >-- a static RingBuf map for storing packet events
+        < #[map]
+        < static EVENTS: RingBuf = RingBuf::with_byte_size(16777216, 0);
+        <
+        41c37
+        <     //info!(&ctx, "received a packet");
+        ---
+        >     info!(&ctx, "received a packet");
+        63d58 >-- extracting source IP and destination port from the packet
+        < 	let src_addr = ip_hdr.src_addr;
+        75d69 >-- extracting destination port from the packet
+        < 	let mut dst_port: u16 = 0;
+        99,109d92 >-- extracting protocol from the packet
+        < 	}
+        <
+        < 	//3.2
+        < 	if let Some(mut entry) = EVENTS.reserve::<PacketEvent>(0) {
+        < 		entry.write(PacketEvent {
+        < 			src_ip,
+        < 			dst_port,
+        < 			protocol: proto as u8,
+        < 			_pad: 0,
+        < 		});
+        < 		entry.submit(0);
+    now we update the main.rs in @ai-firewall/src/  to consume events asynchronously and run automatic rate-limited detection loop.
+                2c2
+        < // 1.3 || 3.1 || 3.2
+        ---
+        > // 1.3 || 3.1
+        5d4 >-- importing PacketEvent
+        < use ai_firewall_common::PacketEvent;
+        7c6 >-- importing RingBuf
+        < use aya::maps::{HashMap, RingBuf};
+        ---
+        > use aya::maps::HashMap;
+        12,13d10 >-- importing StdHashMap
+        < use std::collections::HashMap as StdHashMap;
+        < use std::convert::TryFrom;
+        77c74
+        <         HashMap::try_from(ebpf.map_mut("BLOCKLIST").unwrap())?;
+        ---
+        >     	HashMap::try_from(ebpf.map_mut("BLOCKLIST").unwrap())?;
+        84,126c81,83 >-- importing packet counts
+        <     blocklist.insert(ip_u32, 1, 0)?;
+        <     info!("Successfully added {} (u32: {}) to eBPF BLOCKLIST map!", block_ip, ip_u32);
+        <
+        <     // 7. Consume binary RingBuf packet events
+        <     if let Ok(ring_buf) = RingBuf::try_from(ebpf.map_mut("EVENTS").unwrap()) {
+        <         let mut async_fd = tokio::io::unix::AsyncFd::new(ring_buf)?;
+        <
+        <         tokio::task::spawn(async move {
+        <             let mut packet_counts: StdHashMap<u32, u32> = StdHashMap::new();
+        <
+        <             loop {
+        <                 let mut guard = async_fd.readable_mut().await.unwrap();
+        <                 let ring_buf = guard.get_inner_mut();
+        <
+        <                 while let Some(item) = ring_buf.next() {
+        <                     let data = item.as_ref();
+        <                     if data.len() < std::mem::size_of::<PacketEvent>() {
+        <                         continue;
+        <                     }
+        <
+        <                     let event = unsafe { &*(data.as_ptr() as *const PacketEvent) };
+        <                     let ip = Ipv4Addr::from(event.src_ip);
+        <
+        <                     let count = packet_counts.entry(event.src_ip).or_insert(0);
+        <                     *count += 1;
+        <
+        <                     info!(
+        <                         "[EVENT] IP: {:15} | Port: {:5} | Proto: {:3} | Total: {}",
+        <                         ip, event.dst_port, event.protocol, count
+        <                     );
+        <
+        <                     if *count > 100 {
+        <                         if blocklist.insert(event.src_ip, 1, 0).is_ok() {
+        <                             warn!(" [AUTO-BLOCK] IP {} exceeded packet threshold! Added to kernel BLOCKLIST.", ip);
+        <                         }
+        <                     }
+        <                 }
+        <
+        <                 guard.clear_ready();
+        <             }
+        <         });
+        <     }
+        <
+        ---
+        >    	blocklist.insert(ip_u32, 1, 0)?;
+        >    	info!("Successfully added {} (u32: {}) to eBPF BLOCKLIST map!", block_ip, ip_u32);
+        >
 
-    Consuming in Userspace:
-        - In 'ai-firewall/src/main.rs', load the 'EVENTS' map as a 'RingBuf'.
-        - Wrap it in 'AsyncFd' and spawn a background tokio task.
-        - Loop to read events from the ring buffer:
-          - Extract packet data and cast it to 'PacketEvent'.
-          - Update packet counts in a local 'StdHashMap'.
-          - If the packet count from an IP exceeds 100, insert the IP into the 'BLOCKLIST' map to automatically drop packets.
+    Zero-Copy High Speed Metrics: Kernel writes struct data straight into shared memory ring buffer.
+    Auto-Blocking Engine: Userspace tallies traffic in real-time and inserts suspicious IPs into the kernel BLOCKLIST automatically once they cross a threshold.

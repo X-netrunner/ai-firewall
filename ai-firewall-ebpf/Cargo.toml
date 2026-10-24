@@ -8,7 +8,6 @@ ai-firewall-common = { path = "../ai-firewall-common" }
 network-types = "0.0.5" # 1.2
 
 aya-ebpf = { workspace = true }
-aya-log-ebpf = { workspace = true }
 
 [build-dependencies]
 which = { workspace = true }

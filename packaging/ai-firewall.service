@@ -1,0 +1,30 @@
+[Unit]
+Description=ai-firewall: self-healing eBPF/XDP firewall
+Documentation=file:///etc/ai-firewall/config.toml
+After=network-pre.target
+Wants=network-pre.target
+# Replaces these; starting ai-firewall stops them
+Conflicts=ufw.service firewalld.service
+# Never give up restarting
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ai-firewall run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=2
+
+StateDirectory=ai-firewall
+RuntimeDirectory=ai-firewall
+ConfigurationDirectory=ai-firewall
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_RESOURCE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/sys/fs/bpf
+ProtectHome=yes
+PrivateTmp=yes
+MemoryMax=64M
+
+[Install]
+WantedBy=multi-user.target
