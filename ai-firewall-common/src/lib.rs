@@ -26,7 +26,8 @@ pub const STAT_PASSED: u32 = 0;
 pub const STAT_DROP_BLOCKLIST: u32 = 1;
 pub const STAT_DROP_POLICY: u32 = 2;
 pub const STAT_EVENTS_LOST: u32 = 3;
-pub const STAT_LEN: u32 = 4;
+pub const STAT_DROP_FEED: u32 = 4; // from a network on a blocklist feed
+pub const STAT_LEN: u32 = 5;
 
 /// BLOCKLIST value meaning "never expires"
 pub const BAN_FOREVER: u64 = 0;

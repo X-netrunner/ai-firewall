@@ -21,7 +21,8 @@ use std::{
 
 use ai_firewall_common::{
     CFG_DROP_PING, CFG_ENFORCE, CFG_EPHEMERAL_LOW, CFG_UDP_STRICT, PacketEvent, RuleKey,
-    STAT_DROP_BLOCKLIST, STAT_DROP_POLICY, STAT_EVENTS_LOST, STAT_PASSED, rate_pack,
+    STAT_DROP_BLOCKLIST, STAT_DROP_FEED, STAT_DROP_POLICY, STAT_EVENTS_LOST, STAT_PASSED,
+    rate_pack,
 };
 use anyhow::Context as _;
 use aya::{
@@ -116,6 +117,7 @@ pub struct Status {
     pub passed: u64,
     pub dropped_blocklist: u64,
     pub dropped_policy: u64,
+    pub dropped_feed: u64,
     pub events_lost: u64,
     pub tracked_sources: usize,
     pub allow_tcp: Vec<String>,
@@ -694,9 +696,11 @@ fn apply_feeds(
     if failed > 0 {
         warn!("[!] {failed} feed networks did not fit in the kernel map");
     }
+    // logged when a download changed what is loaded, not every time the cache is re-read at start or reload
     let changed = wanted != k.feed_nets;
+    let first_load = k.feed_nets.is_empty();
     k.feed_nets = wanted;
-    if changed {
+    if changed && !(first_load && results.is_empty()) {
         info!(
             "[*] feeds: {} known-bad networks blocked",
             k.feed_nets.len()
@@ -968,6 +972,7 @@ fn build_status(
         passed: stat(STAT_PASSED),
         dropped_blocklist: stat(STAT_DROP_BLOCKLIST),
         dropped_policy: stat(STAT_DROP_POLICY),
+        dropped_feed: stat(STAT_DROP_FEED),
         events_lost: stat(STAT_EVENTS_LOST),
         tracked_sources: s.detector.tracked(),
         allow_tcp,

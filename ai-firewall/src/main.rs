@@ -266,7 +266,11 @@ fn status() -> anyhow::Result<()> {
             .as_array()
             .into_iter()
             .flatten()
-            .map(|p| p.to_string())
+            .map(|p| {
+                p.as_str()
+                    .map(String::from)
+                    .unwrap_or_else(|| p.to_string())
+            })
             .collect();
         if v.is_empty() {
             "none".into()
@@ -286,6 +290,12 @@ fn status() -> anyhow::Result<()> {
         s["xdp_mode"].as_str().unwrap_or("-"),
         duration(n("updated_unix").saturating_sub(n("started_unix")).max(1)),
         n("attaches"),
+    );
+    println!(
+        "  profile    {}",
+        s["profile"]
+            .as_str()
+            .unwrap_or("default (no profile matches this network)")
     );
     println!("  open tcp   {}", list("allow_tcp"));
     println!(
@@ -308,6 +318,29 @@ fn status() -> anyhow::Result<()> {
         n("tracked_sources"),
         n("events_lost")
     );
+    if n("feed_networks") > 0 {
+        let names: Vec<&str> = s["feeds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|f| f["name"].as_str())
+            .collect();
+        println!(
+            "  feeds      {} known-bad networks ({}), {} packets from them dropped",
+            n("feed_networks"),
+            names.join(", "),
+            n("dropped_feed")
+        );
+    }
+    let rules: Vec<&str> = s["rules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|r| r.as_str())
+        .collect();
+    if !rules.is_empty() {
+        println!("  rules      {}", rules.join("\n             "));
+    }
 
     let bans = s["bans"].as_array().cloned().unwrap_or_default();
     println!("\nbans ({})", bans.len());

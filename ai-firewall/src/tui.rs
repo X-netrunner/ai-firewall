@@ -48,6 +48,7 @@ pub struct StatusView {
     pub passed: u64,
     pub dropped_blocklist: u64,
     pub dropped_policy: u64,
+    pub dropped_feed: u64,
     pub events_lost: u64,
     pub tracked_sources: usize,
     #[serde(deserialize_with = "ports_any")]
@@ -625,9 +626,9 @@ fn draw(f: &mut Frame, app: &mut App) {
             pal.bad,
         ),
         (
-            "watching",
-            s.tracked_sources.to_string(),
-            format!("{} events lost", s.events_lost),
+            "from blocklists",
+            count(s.dropped_feed),
+            format!("{} networks", count(s.feed_networks as u64)),
             pal.accent2,
         ),
     ];

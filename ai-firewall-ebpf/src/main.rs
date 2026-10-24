@@ -8,7 +8,7 @@
 use ai_firewall_common::{
     BAN_FOREVER, CFG_DROP_PING, CFG_ENFORCE, CFG_EPHEMERAL_LOW, CFG_LEN, CFG_UDP_STRICT, FAMILY_V4,
     FAMILY_V6, PROTO_TCP, PROTO_UDP, PacketEvent, RateState, RuleKey, STAT_DROP_BLOCKLIST,
-    STAT_DROP_POLICY, STAT_EVENTS_LOST, STAT_LEN, STAT_PASSED, TCP_FLAG_ACK, TCP_FLAG_FIN,
+    STAT_DROP_FEED, STAT_DROP_POLICY, STAT_EVENTS_LOST, STAT_LEN, STAT_PASSED, TCP_FLAG_ACK, TCP_FLAG_FIN,
     TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_FLAG_URG, UDP_FLOW_TTL_NS, UdpFlow, UdpFlow6,
     VERDICT_DROP_POLICY, VERDICT_PASS,
 };
@@ -161,7 +161,7 @@ fn try_ai_firewall(ctx: &XdpContext) -> Result<u32, ()> {
                 return Ok(xdp_action::XDP_DROP);
             }
             if FEEDS.get(Key::new(32, src_ip.to_be_bytes())).is_some() {
-                bump(STAT_DROP_BLOCKLIST);
+                bump(STAT_DROP_FEED);
                 return Ok(xdp_action::XDP_DROP);
             }
 
