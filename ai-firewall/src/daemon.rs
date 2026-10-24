@@ -128,6 +128,8 @@ pub struct Status {
     pub rules: Vec<String>,
     pub feeds: Vec<FeedState>,
     pub feed_networks: usize,
+    /// the config file has an error; the last config that worked is in force
+    pub config_error: Option<String>,
     pub bans: Vec<StatusBan>,
     pub recent: Vec<RecentBan>,
 }
@@ -143,6 +145,8 @@ pub struct StatusBan {
 
 pub async fn run(config_path: PathBuf, iface_override: Option<String>) -> anyhow::Result<()> {
     let (mut cfg, cfg_error) = Config::load_at_start(&config_path);
+    // what is wrong with the config file right now (shown in status, the doctor and the Center)
+    let mut config_error: Option<String> = cfg_error.as_ref().map(|e| format!("{e:#}"));
     match &cfg_error {
         None => Config::remember_good(&config_path),
         Some(e) => {
@@ -282,7 +286,9 @@ pub async fn run(config_path: PathBuf, iface_override: Option<String>) -> anyhow
                         &mut lock(&shared),
                     ) {
                         error!("[!] could not apply new config: {e:#}");
+                        config_error = Some(format!("{e:#}"));
                     } else {
+                        config_error = None;
                         let feeds_changed = sources_differ(&cfg, &new_cfg);
                         cfg = new_cfg;
                         profile = new_profile;
@@ -295,7 +301,16 @@ pub async fn run(config_path: PathBuf, iface_override: Option<String>) -> anyhow
                         info!("[*] config reloaded ({} mode)", cfg.mode);
                     }
                 }
-                Err(e) => error!("[!] config rejected, keeping the previous one: {e:#}"),
+                Err(e) => {
+                    error!("[!] config rejected, keeping the previous one: {e:#}");
+                    if config_error.is_none() {
+                        history::notify(
+                            "Firewall config has an error",
+                            "The last config that worked stays in force. Check it: ai-firewall check",
+                        );
+                    }
+                    config_error = Some(format!("{e:#}"));
+                }
             }
         }
 
@@ -370,7 +385,7 @@ pub async fn run(config_path: PathBuf, iface_override: Option<String>) -> anyhow
                 save(&mut s);
             }
             let policy = cfg.policy(profile.as_deref());
-            let status = build_status(
+            let mut status = build_status(
                 &cfg,
                 &policy,
                 &feed_states,
@@ -381,6 +396,7 @@ pub async fn run(config_path: PathBuf, iface_override: Option<String>) -> anyhow
                 started,
                 attaches,
             );
+            status.config_error = config_error.clone();
             if let Err(e) = serde_json::to_vec_pretty(&status)
                 .map_err(anyhow::Error::from)
                 .and_then(|j| state::write_atomic(Path::new(state::STATUS_FILE), &j))
@@ -531,47 +547,13 @@ fn apply_config(
     settings.set(CFG_EPHEMERAL_LOW, net::ephemeral_low(), 0)?;
     settings.set(CFG_DROP_PING, (!policy.allow_ping) as u32, 0)?;
 
-    // Ports open to everyone: the lists plus rules without `from`
-    let mut tcp: HashSet<u16> = expand(&policy.allow_tcp)?.into_iter().collect();
-    let mut udp: HashSet<u16> = expand(&policy.allow_udp)?
-        .into_iter()
-        .chain(DHCP_CLIENT_PORTS)
-        .collect();
-    let mut from_tcp = HashSet::new();
-    let mut from_udp = HashSet::new();
-    let mut rates: StdHashMap<u16, u32> = StdHashMap::new();
-    for rule in &policy.rules {
-        let ports = rule.port.ports()?;
-        let tcp_rule = rule.proto == "tcp";
-        for port in ports {
-            match &rule.from {
-                None if tcp_rule => drop(tcp.insert(port)),
-                None => drop(udp.insert(port)),
-                Some(f) => {
-                    let c = Cidr::parse(f)?;
-                    let p = port.to_be_bytes();
-                    let a = c.net.to_be_bytes();
-                    let key = (
-                        16 + c.mask.leading_ones(),
-                        [p[0], p[1], a[0], a[1], a[2], a[3]],
-                    );
-                    if tcp_rule {
-                        from_tcp.insert(key)
-                    } else {
-                        from_udp.insert(key)
-                    };
-                }
-            }
-            if let Some((max, window)) = rule.rate()? {
-                // two rules limiting one port: the stricter one wins
-                let packed = rate_pack(max, window);
-                rates
-                    .entry(port)
-                    .and_modify(|r| *r = (*r).min(packed))
-                    .or_insert(packed);
-            }
-        }
-    }
+    let Compiled {
+        tcp,
+        udp,
+        from_tcp,
+        from_udp,
+        rates,
+    } = compile(policy)?;
     sync_ports(&mut k.tcp, &mut k.open_tcp, tcp)?;
     sync_ports(&mut k.udp, &mut k.open_udp, udp)?;
     sync_trie(&mut k.from_tcp, &mut k.from_tcp_keys, from_tcp)?;
@@ -620,6 +602,68 @@ fn apply_config(
     }
     s.dirty = true;
     Ok(())
+}
+
+/// A policy as the kernel maps want it
+#[derive(Debug, Default, PartialEq)]
+struct Compiled {
+    /// ports open to everyone: the lists, rules without `from`, and the DHCP client ports
+    tcp: HashSet<u16>,
+    udp: HashSet<u16>,
+    /// (LPM prefix length, port + network) for rules with `from`
+    from_tcp: HashSet<(u32, RuleKey)>,
+    from_udp: HashSet<(u32, RuleKey)>,
+    /// port -> packed limit on new TCP connections per source
+    rates: StdHashMap<u16, u32>,
+}
+
+fn compile(policy: &Policy) -> anyhow::Result<Compiled> {
+    let mut c = Compiled {
+        tcp: expand(&policy.allow_tcp)?.into_iter().collect(),
+        udp: expand(&policy.allow_udp)?
+            .into_iter()
+            .chain(DHCP_CLIENT_PORTS)
+            .collect(),
+        ..Default::default()
+    };
+    for rule in &policy.rules {
+        let tcp_rule = rule.proto == "tcp";
+        let from = rule.from.as_deref().map(Cidr::parse).transpose()?;
+        let rate = rule.rate()?;
+        for port in rule.port.ports()? {
+            match &from {
+                None if tcp_rule => drop(c.tcp.insert(port)),
+                None => drop(c.udp.insert(port)),
+                Some(net) => {
+                    let p = port.to_be_bytes();
+                    let a = net.net.to_be_bytes();
+                    let key = (
+                        16 + net.mask.leading_ones(),
+                        [p[0], p[1], a[0], a[1], a[2], a[3]],
+                    );
+                    let set = if tcp_rule {
+                        &mut c.from_tcp
+                    } else {
+                        &mut c.from_udp
+                    };
+                    set.insert(key);
+                }
+            }
+            if let Some((max, window)) = rate {
+                // two rules limiting one port: the lower rate (count per second) wins
+                c.rates
+                    .entry(port)
+                    .and_modify(|r| {
+                        let (m, w) = ((*r >> 16) as u64, (*r & 0xffff) as u64);
+                        if (max as u64) * w < m * (window as u64) {
+                            *r = rate_pack(max, window);
+                        }
+                    })
+                    .or_insert(rate_pack(max, window));
+            }
+        }
+    }
+    Ok(c)
 }
 
 fn sync_trie(
@@ -983,7 +1027,64 @@ fn build_status(
         rules: policy.rules.iter().map(|r| r.label()).collect(),
         feeds: feed_states.to_vec(),
         feed_networks,
+        config_error: None,
         bans,
         recent: s.recent.iter().cloned().collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    fn compiled(toml: &str) -> Compiled {
+        let cfg = Config::parse(toml).unwrap();
+        compile(&cfg.policy(None)).unwrap()
+    }
+
+    #[test]
+    fn rules_compile_to_kernel_keys() {
+        let c = compiled(
+            r#"
+allow_tcp = [80, "1714-1716"]
+allow_udp = []
+[[rule]]
+proto = "tcp"
+port = 22
+from = "192.168.1.0/24"
+[[rule]]
+proto = "udp"
+port = 51820
+"#,
+        );
+        assert_eq!(c.tcp, HashSet::from([80, 1714, 1715, 1716]));
+        // DHCP client ports are always open, plus the rule without `from`
+        assert_eq!(c.udp, HashSet::from([68, 546, 51820]));
+        // 22 from 192.168.1.0/24: port then network, big-endian; prefix = 16 port bits + 24
+        assert_eq!(c.from_tcp, HashSet::from([(40, [0, 22, 192, 168, 1, 0])]));
+        assert!(c.from_udp.is_empty() && c.rates.is_empty());
+    }
+
+    #[test]
+    fn the_lower_rate_wins() {
+        let c = compiled(
+            r#"
+[[rule]]
+proto = "tcp"
+port = 22
+limit = "5/1s"
+[[rule]]
+proto = "tcp"
+port = 22
+limit = "6/60s"
+"#,
+        );
+        // 6 per minute is far stricter than 5 per second, although 5 < 6
+        assert_eq!(c.rates.get(&22), Some(&rate_pack(6, 60)));
+        assert!(
+            c.tcp.contains(&22),
+            "a limited rule without `from` still opens the port"
+        );
     }
 }

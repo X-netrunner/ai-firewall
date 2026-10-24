@@ -279,6 +279,15 @@ pub fn diagnose() -> Vec<Finding> {
 fn check_firewall(out: &mut Vec<Finding>) {
     match StatusView::read() {
         Some(s) if s.alive() => {
+            if let Some(err) = &s.config_error {
+                out.push(finding(
+                    "firewall",
+                    Severity::Fail,
+                    "The config file has an error",
+                    format!("the last config that worked is in force until it is fixed (`ai-firewall check` shows it again): {err}"),
+                    None,
+                ));
+            }
             let iface = s.interface.as_deref().unwrap_or("nothing");
             if s.mode == "enforce" {
                 out.push(finding("firewall", Severity::Ok, "ai-firewall is protecting", format!("guarding {iface}"), None));

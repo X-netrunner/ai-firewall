@@ -321,6 +321,34 @@ mod tests {
         assert_eq!(scan(&mut d, later).strikes, 1);
     }
 
+    fn ev6(prefix: &str, port: u16) -> PacketEvent {
+        let Src::V6(p) = prefix.parse::<Src>().unwrap() else {
+            unreachable!()
+        };
+        PacketEvent {
+            src6: p,
+            src_ip: 0,
+            family: ai_firewall_common::FAMILY_V6,
+            ..ev(PROTO_TCP, TCP_FLAG_SYN, port, VERDICT_DROP_POLICY)
+        }
+    }
+
+    #[test]
+    fn ipv6_scans_ban_the_whole_64() {
+        let mut d = det();
+        let ban = (1..=20)
+            .find_map(|p| d.observe(&ev6("2001:db8:aa:bb::7", p), 0))
+            .expect("v6 scan is banned");
+        assert_eq!(ban.ip.to_string(), "2001:db8:aa:bb::/64");
+        // another address in the same /64 counts as the same source
+        assert!(
+            d.offenders()
+                .contains_key(&"2001:db8:aa:bb:ffff::1".parse().unwrap())
+        );
+        // link-local neighbours (the router's fe80:: address) are never banned
+        assert!((1..=200).all(|p| d.observe(&ev6("fe80::1", p), 0).is_none()));
+    }
+
     #[test]
     fn protected_sources_are_never_banned() {
         let mut d = det();

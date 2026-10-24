@@ -117,39 +117,66 @@ pub fn notify(title: &str, body: &str) {
         .spawn();
 }
 
-/// Groups bans between flushes into one notification
+/// At most one ban notification a minute: bans in between are collected into the next one,
+/// so a sustained attack is a notification a minute, not one per tick
+pub const NOTE_INTERVAL_SECS: u64 = 60;
+const NOTE_SHOWN: usize = 3;
+
 #[derive(Default)]
 pub struct BanNotes {
-    pending: Vec<(String, String)>,
+    /// the first few since the last notification, shown by name
+    shown: Vec<(String, String)>,
+    /// all of them, named or not
+    count: usize,
+    last_sent: Option<u64>,
 }
 
 impl BanNotes {
     pub fn push(&mut self, ip: String, reason: String) {
-        self.pending.push((ip, reason));
+        if self.shown.len() < NOTE_SHOWN {
+            self.shown.push((ip, reason));
+        }
+        self.count += 1;
+    }
+
+    /// The notification due now, if any: (title, body)
+    pub fn take(&mut self, now: u64) -> Option<(String, String)> {
+        if self.count == 0
+            || self
+                .last_sent
+                .is_some_and(|t| now.saturating_sub(t) < NOTE_INTERVAL_SECS)
+        {
+            return None;
+        }
+        let note = if self.count == 1 {
+            let (ip, reason) = self.shown.remove(0);
+            (format!("Banned {ip}"), reason)
+        } else {
+            let list: Vec<String> = self
+                .shown
+                .iter()
+                .map(|(ip, r)| format!("{ip}: {r}"))
+                .collect();
+            let more = self.count - self.shown.len();
+            let more = if more > 0 {
+                format!("\n+{more} more")
+            } else {
+                String::new()
+            };
+            (
+                format!("Banned {} sources", self.count),
+                list.join("\n") + &more,
+            )
+        };
+        self.shown.clear();
+        self.count = 0;
+        self.last_sent = Some(now);
+        Some(note)
     }
 
     pub fn flush(&mut self) {
-        match self.pending.len() {
-            0 => {}
-            1 => {
-                let (ip, reason) = self.pending.remove(0);
-                notify(&format!("Banned {ip}"), &reason);
-            }
-            n => {
-                let list: Vec<String> = self
-                    .pending
-                    .iter()
-                    .take(3)
-                    .map(|(ip, r)| format!("{ip}: {r}"))
-                    .collect();
-                let more = if n > 3 {
-                    format!("\n+{} more", n - 3)
-                } else {
-                    String::new()
-                };
-                notify(&format!("Banned {n} sources"), &(list.join("\n") + &more));
-                self.pending.clear();
-            }
+        if let Some((title, body)) = self.take(unix_secs()) {
+            notify(&title, &body);
         }
     }
 }
@@ -157,6 +184,29 @@ impl BanNotes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notifications_are_throttled_and_grouped() {
+        let mut n = BanNotes::default();
+        assert_eq!(n.take(1000), None);
+        n.push("1.1.1.1".into(), "port scan".into());
+        assert_eq!(
+            n.take(1000),
+            Some(("Banned 1.1.1.1".into(), "port scan".into()))
+        );
+        // a burst within the minute waits, then comes as one
+        for i in 0..10 {
+            n.push(format!("2.2.2.{i}"), "udp flood".into());
+        }
+        assert_eq!(n.take(1030), None);
+        let (title, body) = n.take(1061).unwrap();
+        assert_eq!(title, "Banned 10 sources");
+        assert!(
+            body.starts_with("2.2.2.0: udp flood") && body.ends_with("+7 more"),
+            "{body}"
+        );
+        assert_eq!(n.take(2000), None, "nothing new, nothing sent");
+    }
 
     #[test]
     fn entry_round_trip() {

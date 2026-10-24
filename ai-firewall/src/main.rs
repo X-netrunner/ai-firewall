@@ -291,6 +291,11 @@ fn status() -> anyhow::Result<()> {
         duration(n("updated_unix").saturating_sub(n("started_unix")).max(1)),
         n("attaches"),
     );
+    if let Some(err) = s["config_error"].as_str() {
+        println!(
+            "  CONFIG     has an error, the last config that worked is in force:\n             {err}"
+        );
+    }
     println!(
         "  profile    {}",
         s["profile"]

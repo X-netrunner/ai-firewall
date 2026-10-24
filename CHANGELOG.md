@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1
+
+- **Fix:** two rules limiting the same port now keep the lower rate (count per second). Before, `5/1s`
+  could win over `6/60s` because only the count was compared first.
+- **Fix:** ban notifications are throttled to one a minute; bans in between are grouped into it (a
+  sustained attack used to mean one every 3 seconds).
+- **Config errors are visible:** `status`, the doctor, `top` and the Firewall Center say when the config
+  file is broken and the last config that worked is in force (plus one desktop notification).
+- Blocklist drops have their own counter (`from blocklists`), separate from bans.
+- `status` shows the network profile, feeds and rules; ports print without quotes.
+- History only logs feed changes that came from a download.
+- Tests for rule compilation, notification grouping and IPv6 bans (28 in all).
+
 ## 0.2.0
 
 - **Rules:** port ranges (`"1714-1764"`), ports open only to some networks (`[[rule]] from = ...`), and a

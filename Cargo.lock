@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "ai-firewall"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ai-firewall-common",
  "ai-firewall-ebpf",
@@ -38,14 +38,14 @@ dependencies = [
 
 [[package]]
 name = "ai-firewall-common"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "ai-firewall-ebpf"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "ai-firewall-common",
  "aya-ebpf",

@@ -59,6 +59,7 @@ pub struct StatusView {
     pub rules: Vec<String>,
     pub feeds: Vec<FeedView>,
     pub feed_networks: usize,
+    pub config_error: Option<String>,
     pub bans: Vec<BanView>,
     pub recent: Vec<RecentView>,
 }
@@ -824,6 +825,18 @@ fn draw_header(f: &mut Frame, area: Rect, pal: &Pal, s: Option<&StatusView>) {
             spans.push(Span::styled(
                 format!(" · healed {}x", s.attaches - 1),
                 Style::default().fg(pal.accent2),
+            ));
+        }
+        if let Some(p) = &s.profile {
+            spans.push(Span::styled(
+                format!(" · profile {p}"),
+                Style::default().fg(pal.accent),
+            ));
+        }
+        if s.config_error.is_some() {
+            spans.push(Span::styled(
+                "  ⚠ config error, last good config in force (ai-firewall check)",
+                Style::default().fg(pal.bad).add_modifier(Modifier::BOLD),
             ));
         }
     }
