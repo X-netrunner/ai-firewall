@@ -2,13 +2,17 @@
 // 5.1 Host facts: uplink interface, gateway, DNS, own addresses, kernel clock
 //---------------------------
 
-use crate::config::Cidr;
 use std::net::Ipv4Addr;
+
+use crate::config::Cidr;
 
 /// CLOCK_BOOTTIME in ns: the same clock `bpf_ktime_get_boot_ns` reads, and it keeps
 /// counting through suspend so bans don't stretch while the laptop sleeps
 pub fn boot_ns() -> u64 {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
     ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64
 }
@@ -47,8 +51,28 @@ fn parse_default_route(text: &str) -> Option<(String, u32)> {
         .map(|(_, iface, gw)| (iface, gw))
 }
 
+/// Names of the active NetworkManager connections (wifi network names, "Wired connection 1" ...);
+/// empty without NetworkManager
+pub fn active_connections() -> Vec<String> {
+    let Ok(out) = std::process::Command::new("nmcli")
+        .args(["-t", "-f", "NAME", "connection", "show", "--active"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| l.replace("\\:", ":").replace("\\\\", "\\"))
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
 pub fn ifindex(iface: &str) -> Option<u32> {
-    std::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex")).ok()?.trim().parse().ok()
+    std::fs::read_to_string(format!("/sys/class/net/{iface}/ifindex"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 pub fn ephemeral_low() -> u32 {
@@ -64,10 +88,10 @@ pub fn nameservers() -> Vec<u32> {
     for path in ["/etc/resolv.conf", "/run/systemd/resolve/resolv.conf"] {
         if let Ok(text) = std::fs::read_to_string(path) {
             for line in text.lines() {
-                if let Some(rest) = line.trim().strip_prefix("nameserver") {
-                    if let Ok(ip) = rest.trim().parse::<Ipv4Addr>() {
-                        out.push(u32::from(ip));
-                    }
+                if let Some(rest) = line.trim().strip_prefix("nameserver")
+                    && let Ok(ip) = rest.trim().parse::<Ipv4Addr>()
+                {
+                    out.push(u32::from(ip));
                 }
             }
         }
@@ -88,7 +112,9 @@ pub struct IfaceNet {
 
 /// True for virtual-machine / container bridges (libvirt, Docker, Podman, LXD)
 pub fn is_virt_bridge(iface: &str) -> bool {
-    ["virbr", "docker", "br-", "podman", "lxdbr", "vmnet", "cni"].iter().any(|p| iface.starts_with(p))
+    ["virbr", "docker", "br-", "podman", "lxdbr", "vmnet", "cni"]
+        .iter()
+        .any(|p| iface.starts_with(p))
 }
 
 pub fn virt_bridges() -> Vec<String> {
@@ -118,10 +144,23 @@ pub fn interface_networks() -> Vec<IfaceNet> {
             let mask = if ifa.ifa_netmask.is_null() {
                 u32::MAX
             } else {
-                u32::from_be(unsafe { &*(ifa.ifa_netmask as *const libc::sockaddr_in) }.sin_addr.s_addr)
+                u32::from_be(
+                    unsafe { &*(ifa.ifa_netmask as *const libc::sockaddr_in) }
+                        .sin_addr
+                        .s_addr,
+                )
             };
-            let iface = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }.to_string_lossy().into_owned();
-            out.push(IfaceNet { iface, addr, net: Cidr { net: addr & mask, mask } });
+            let iface = unsafe { std::ffi::CStr::from_ptr(ifa.ifa_name) }
+                .to_string_lossy()
+                .into_owned();
+            out.push(IfaceNet {
+                iface,
+                addr,
+                net: Cidr {
+                    net: addr & mask,
+                    mask,
+                },
+            });
         }
         cur = ifa.ifa_next;
     }
@@ -139,7 +178,8 @@ pub fn own_v6_prefixes() -> Vec<u64> {
     let mut cur = ifap;
     while !cur.is_null() {
         let ifa = unsafe { &*cur };
-        if !ifa.ifa_addr.is_null() && unsafe { (*ifa.ifa_addr).sa_family } as i32 == libc::AF_INET6 {
+        if !ifa.ifa_addr.is_null() && unsafe { (*ifa.ifa_addr).sa_family } as i32 == libc::AF_INET6
+        {
             let sin6 = unsafe { &*(ifa.ifa_addr as *const libc::sockaddr_in6) };
             let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
             if !ip.is_loopback() {
@@ -164,7 +204,12 @@ pub fn auto_protected() -> Vec<Cidr> {
     out.extend(nameservers().into_iter().map(Cidr::single));
     out.extend(own_addresses().into_iter().map(Cidr::single));
     // Your own VMs and containers
-    out.extend(interface_networks().into_iter().filter(|n| is_virt_bridge(&n.iface)).map(|n| n.net));
+    out.extend(
+        interface_networks()
+            .into_iter()
+            .filter(|n| is_virt_bridge(&n.iface))
+            .map(|n| n.net),
+    );
     out
 }
 

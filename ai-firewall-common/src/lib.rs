@@ -110,3 +110,25 @@ impl PacketEvent {
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for PacketEvent {}
+
+// 11.1 Richer rules
+/// "allow <port> from <cidr>": LPM trie key data = port (big-endian) then IPv4 address (big-endian),
+/// prefix length = 16 + the CIDR's bits, so one lookup of (port, source) finds the narrowest match
+pub type RuleKey = [u8; 6];
+
+/// Per-port rate limit for new TCP connections: (max << 16) | window_secs, 0 = no limit
+#[inline]
+pub const fn rate_pack(max: u16, window_secs: u16) -> u32 {
+    ((max as u32) << 16) | window_secs as u32
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RateState {
+    pub window_start: u64,
+    pub count: u32,
+    pub _pad: u32,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for RateState {}

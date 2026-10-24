@@ -6,10 +6,14 @@
 // limit, so a score of 1.0 means "one full limit's worth of hostile behaviour", whether
 // that came from one signal or a mix (a slow scan that also floods a little still trips).
 
-use crate::addr::Src;
-use crate::config::{BanConfig, Cidr, DetectorConfig};
-use ai_firewall_common::{PROTO_UDP, PacketEvent, VERDICT_DROP_POLICY};
 use std::collections::HashMap;
+
+use ai_firewall_common::{PROTO_UDP, PacketEvent, VERDICT_DROP_POLICY};
+
+use crate::{
+    addr::Src,
+    config::{BanConfig, Cidr, DetectorConfig},
+};
 
 /// Upper bound on sources tracked at once, so a spoofed flood can't grow memory forever
 const MAX_TRACKED: usize = 16384;
@@ -56,7 +60,14 @@ pub struct Detector {
 
 impl Detector {
     pub fn new(cfg: DetectorConfig, bans: BanConfig) -> Self {
-        Self { cfg, bans, protected: Vec::new(), protected6: Vec::new(), tracks: HashMap::new(), offenders: HashMap::new() }
+        Self {
+            cfg,
+            bans,
+            protected: Vec::new(),
+            protected6: Vec::new(),
+            tracks: HashMap::new(),
+            offenders: HashMap::new(),
+        }
     }
 
     pub fn reconfigure(&mut self, cfg: DetectorConfig, bans: BanConfig) {
@@ -68,7 +79,10 @@ impl Detector {
         self.protected = protected;
         self.protected6 = protected6;
         let tracks = std::mem::take(&mut self.tracks);
-        self.tracks = tracks.into_iter().filter(|(src, _)| !self.is_protected(*src)).collect();
+        self.tracks = tracks
+            .into_iter()
+            .filter(|(src, _)| !self.is_protected(*src))
+            .collect();
     }
 
     pub fn is_protected(&self, src: Src) -> bool {
@@ -107,7 +121,10 @@ impl Detector {
         let cfg = &self.cfg;
         let track = self.tracks.entry(ip).or_default();
         if now.saturating_sub(track.window_start) >= cfg.window_secs {
-            *track = Track { window_start: now, ..Default::default() };
+            *track = Track {
+                window_start: now,
+                ..Default::default()
+            };
         }
 
         if ev.protocol == PROTO_UDP {
@@ -131,9 +148,15 @@ impl Detector {
 
         let signals = [
             (track.syn as f32 / cfg.syn_limit as f32, "connection flood"),
-            (track.ports.len() as f32 / cfg.port_limit as f32, "port scan"),
+            (
+                track.ports.len() as f32 / cfg.port_limit as f32,
+                "port scan",
+            ),
             (track.udp as f32 / cfg.udp_limit as f32, "udp flood"),
-            (track.drops as f32 / cfg.drop_limit as f32, "probing closed ports"),
+            (
+                track.drops as f32 / cfg.drop_limit as f32,
+                "probing closed ports",
+            ),
             (track.odd as f32 / ODD_LIMIT, "stealth scan"),
         ];
         // One port is normal traffic, not a scan signal
@@ -141,7 +164,11 @@ impl Detector {
         if score < 1.0 {
             return None;
         }
-        let reason = signals.iter().max_by(|a, b| a.0.total_cmp(&b.0)).map(|s| s.1).unwrap_or("anomaly");
+        let reason = signals
+            .iter()
+            .max_by(|a, b| a.0.total_cmp(&b.0))
+            .map(|s| s.1)
+            .unwrap_or("anomaly");
         let track = self.tracks.remove(&ip).unwrap_or_default();
         let proto = match (track.tcp_seen, track.udp_seen) {
             (true, true) => "tcp/udp",
@@ -157,32 +184,59 @@ impl Detector {
     }
 
     /// Repeat offenders get exponentially longer bans: base, 2x, 4x ... up to max
-    fn escalate(&mut self, ip: Src, score: f32, reason: &'static str, ports: String, now: u64) -> Ban {
+    fn escalate(
+        &mut self,
+        ip: Src,
+        score: f32,
+        reason: &'static str,
+        ports: String,
+        now: u64,
+    ) -> Ban {
         let forgive = self.bans.forgive_secs;
-        let offender = self.offenders.entry(ip).or_insert(Offender { strikes: 0, last_ban: now });
+        let offender = self.offenders.entry(ip).or_insert(Offender {
+            strikes: 0,
+            last_ban: now,
+        });
         if now.saturating_sub(offender.last_ban) > forgive {
             offender.strikes = 0;
         }
         offender.strikes += 1;
         offender.last_ban = now;
         let shift = (offender.strikes - 1).min(20);
-        let secs = self.bans.base_secs.saturating_mul(1 << shift).min(self.bans.max_secs);
-        Ban { ip, secs, strikes: offender.strikes, score, reason, ports }
+        let secs = self
+            .bans
+            .base_secs
+            .saturating_mul(1 << shift)
+            .min(self.bans.max_secs);
+        Ban {
+            ip,
+            secs,
+            strikes: offender.strikes,
+            score,
+            reason,
+            ports,
+        }
     }
 
     /// Drop finished windows and forgiven offenders
     pub fn prune(&mut self, now: u64) {
         let window = self.cfg.window_secs;
-        self.tracks.retain(|_, t| now.saturating_sub(t.window_start) < window);
+        self.tracks
+            .retain(|_, t| now.saturating_sub(t.window_start) < window);
         let keep = self.bans.forgive_secs.saturating_add(self.bans.max_secs);
-        self.offenders.retain(|_, o| now.saturating_sub(o.last_ban) <= keep);
+        self.offenders
+            .retain(|_, o| now.saturating_sub(o.last_ban) <= keep);
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use ai_firewall_common::{
+        PROTO_TCP, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_SYN, TCP_FLAG_URG,
+        VERDICT_PASS,
+    };
+
     use super::*;
-    use ai_firewall_common::{PROTO_TCP, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH, TCP_FLAG_SYN, TCP_FLAG_URG, VERDICT_PASS};
 
     const ATTACKER: u32 = 0x0a00_0005;
     const ATTACKER_SRC: Src = Src::V4(ATTACKER);
@@ -226,7 +280,10 @@ mod tests {
         // 3 new connections a second to an open port for a minute
         for t in 0..60 {
             for _ in 0..3 {
-                assert_eq!(d.observe(&ev(PROTO_TCP, TCP_FLAG_SYN, 22, VERDICT_PASS), t), None);
+                assert_eq!(
+                    d.observe(&ev(PROTO_TCP, TCP_FLAG_SYN, 22, VERDICT_PASS), t),
+                    None
+                );
             }
         }
     }
@@ -235,8 +292,14 @@ mod tests {
     fn stealth_scans_ban_fast() {
         let mut d = det();
         let xmas = TCP_FLAG_FIN | TCP_FLAG_PSH | TCP_FLAG_URG;
-        assert!(d.observe(&ev(PROTO_TCP, 0, 80, VERDICT_DROP_POLICY), 0).is_none());
-        assert!(d.observe(&ev(PROTO_TCP, xmas, 81, VERDICT_DROP_POLICY), 0).is_none());
+        assert!(
+            d.observe(&ev(PROTO_TCP, 0, 80, VERDICT_DROP_POLICY), 0)
+                .is_none()
+        );
+        assert!(
+            d.observe(&ev(PROTO_TCP, xmas, 81, VERDICT_DROP_POLICY), 0)
+                .is_none()
+        );
         let ban = d.observe(&ev(PROTO_TCP, TCP_FLAG_FIN, 82, VERDICT_DROP_POLICY), 0);
         assert!(ban.is_some());
         // a FIN+ACK is ordinary teardown, not a scan
@@ -247,7 +310,9 @@ mod tests {
     fn repeat_offenders_escalate_then_get_forgiven() {
         let mut d = det();
         let scan = |d: &mut Detector, now| {
-            (1..=20).find_map(|p| d.observe(&ev(PROTO_TCP, TCP_FLAG_SYN, p, VERDICT_DROP_POLICY), now)).unwrap()
+            (1..=20)
+                .find_map(|p| d.observe(&ev(PROTO_TCP, TCP_FLAG_SYN, p, VERDICT_DROP_POLICY), now))
+                .unwrap()
         };
         assert_eq!(scan(&mut d, 0).secs, 120);
         assert_eq!(scan(&mut d, 200).secs, 240);
@@ -263,7 +328,10 @@ mod tests {
         assert!(d.is_protected(ATTACKER_SRC));
         assert!(d.is_protected("fe80::1".parse().unwrap()));
         for p in 1..=200 {
-            assert!(d.observe(&ev(PROTO_TCP, TCP_FLAG_SYN, p, VERDICT_DROP_POLICY), 0).is_none());
+            assert!(
+                d.observe(&ev(PROTO_TCP, TCP_FLAG_SYN, p, VERDICT_DROP_POLICY), 0)
+                    .is_none()
+            );
         }
     }
 
@@ -273,7 +341,10 @@ mod tests {
         for t in 0..10 {
             // a few ports per window stays well under the limits when each window resets
             for p in 1..=6 {
-                assert!(d.observe(&ev(PROTO_TCP, TCP_FLAG_SYN, p, VERDICT_PASS), t * 10).is_none());
+                assert!(
+                    d.observe(&ev(PROTO_TCP, TCP_FLAG_SYN, p, VERDICT_PASS), t * 10)
+                        .is_none()
+                );
             }
         }
         d.prune(1000);

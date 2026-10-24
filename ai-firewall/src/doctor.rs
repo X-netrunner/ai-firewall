@@ -6,13 +6,15 @@
 // `ai-firewall fix <id>` is the only way anything (you, the dashboard, an assistant)
 // can change the system from here, so the list below is the whole allowlist.
 
-use crate::net;
-use crate::state;
-use crate::tui::StatusView;
+use std::{
+    net::{Ipv4Addr, SocketAddr, TcpStream},
+    process::Command,
+    time::Duration,
+};
+
 use serde::Serialize;
-use std::net::{Ipv4Addr, SocketAddr, TcpStream};
-use std::process::Command;
-use std::time::Duration;
+
+use crate::{net, state, tui::StatusView};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -38,22 +40,58 @@ pub struct Fix {
 }
 
 pub const FIXES: &[Fix] = &[
-    Fix { id: "start-firewall", summary: "restart the ai-firewall service" },
-    Fix { id: "disable-ufw", summary: "turn ufw off and disable it (ai-firewall replaces it)" },
-    Fix { id: "disable-firewalld", summary: "turn firewalld off and disable it" },
-    Fix { id: "enable-forwarding", summary: "turn on IPv4 forwarding now and at boot (VMs and containers need it)" },
-    Fix { id: "allow-vm-forwarding", summary: "let VM bridges through the FORWARD drop policy (out: all, in: replies only)" },
-    Fix { id: "restart-libvirt-network", summary: "restart libvirt's networking so it re-adds its NAT rules" },
-    Fix { id: "restart-resolved", summary: "restart systemd-resolved (DNS)" },
-    Fix { id: "unban-protected", summary: "lift bans on your router, DNS servers, own addresses and VM networks" },
+    Fix {
+        id: "start-firewall",
+        summary: "restart the ai-firewall service",
+    },
+    Fix {
+        id: "disable-ufw",
+        summary: "turn ufw off and disable it (ai-firewall replaces it)",
+    },
+    Fix {
+        id: "disable-firewalld",
+        summary: "turn firewalld off and disable it",
+    },
+    Fix {
+        id: "enable-forwarding",
+        summary: "turn on IPv4 forwarding now and at boot (VMs and containers need it)",
+    },
+    Fix {
+        id: "allow-vm-forwarding",
+        summary: "let VM bridges through the FORWARD drop policy (out: all, in: replies only)",
+    },
+    Fix {
+        id: "restart-libvirt-network",
+        summary: "restart libvirt's networking so it re-adds its NAT rules",
+    },
+    Fix {
+        id: "restart-resolved",
+        summary: "restart systemd-resolved (DNS)",
+    },
+    Fix {
+        id: "unban-protected",
+        summary: "lift bans on your router, DNS servers, own addresses and VM networks",
+    },
 ];
 
 pub fn fix_summary(id: &str) -> Option<&'static str> {
     FIXES.iter().find(|f| f.id == id).map(|f| f.summary)
 }
 
-fn finding(area: &'static str, severity: Severity, title: impl Into<String>, detail: impl Into<String>, fix: Option<&'static str>) -> Finding {
-    Finding { area, severity, title: title.into(), detail: detail.into(), fix }
+fn finding(
+    area: &'static str,
+    severity: Severity,
+    title: impl Into<String>,
+    detail: impl Into<String>,
+    fix: Option<&'static str>,
+) -> Finding {
+    Finding {
+        area,
+        severity,
+        title: title.into(),
+        detail: detail.into(),
+        fix,
+    }
 }
 
 fn is_root() -> bool {
@@ -62,7 +100,9 @@ fn is_root() -> bool {
 
 fn run(cmd: &str, args: &[&str]) -> Option<String> {
     let out = Command::new(cmd).args(args).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 fn unit_active(unit: &str) -> bool {
@@ -113,7 +153,11 @@ pub fn parse_ruleset(text: &str) -> Vec<Chain> {
             }
         } else if let Some(c) = current.as_mut() {
             if t.starts_with("type ") {
-                c.hook = t.split("hook ").nth(1).and_then(|h| h.split_whitespace().next()).map(String::from);
+                c.hook = t
+                    .split("hook ")
+                    .nth(1)
+                    .and_then(|h| h.split_whitespace().next())
+                    .map(String::from);
                 c.policy_drop = t.contains("policy drop");
             } else {
                 c.body.push_str(t);
@@ -143,7 +187,11 @@ pub fn blocking_forward_chains<'a>(chains: &'a [Chain], bridge: &str) -> Vec<&'a
     chains
         .iter()
         .filter(|c| c.hook.as_deref() == Some("forward") && c.policy_drop)
-        .filter(|c| !c.body.lines().any(|l| l.contains(&lets_out) && l.contains("accept")))
+        .filter(|c| {
+            !c.body
+                .lines()
+                .any(|l| l.contains(&lets_out) && l.contains("accept"))
+        })
         .collect()
 }
 
@@ -161,15 +209,41 @@ pub fn ensure_vm_forwarding() -> anyhow::Result<Vec<String>> {
     };
     for bridge in bridges {
         for c in blocking_forward_chains(&chains, &bridge) {
-            let base = ["insert", "rule", c.family.as_str(), c.table.as_str(), c.name.as_str()];
+            let base = [
+                "insert",
+                "rule",
+                c.family.as_str(),
+                c.table.as_str(),
+                c.name.as_str(),
+            ];
             let quoted = format!("\"{bridge}\"");
-            let reply = [&base[..], &["oifname", &quoted, "ct", "state", "related,established", "accept", "comment", "\"ai-firewall\""]].concat();
-            let out = [&base[..], &["iifname", &quoted, "accept", "comment", "\"ai-firewall\""]].concat();
+            let reply = [
+                &base[..],
+                &[
+                    "oifname",
+                    &quoted,
+                    "ct",
+                    "state",
+                    "related,established",
+                    "accept",
+                    "comment",
+                    "\"ai-firewall\"",
+                ],
+            ]
+            .concat();
+            let out = [
+                &base[..],
+                &["iifname", &quoted, "accept", "comment", "\"ai-firewall\""],
+            ]
+            .concat();
             for args in [reply, out] {
                 let status = Command::new("nft").args(&args).status()?;
                 anyhow::ensure!(status.success(), "nft {} failed", args.join(" "));
             }
-            changed.push(format!("{bridge} through {} {} {}", c.family, c.table, c.name));
+            changed.push(format!(
+                "{bridge} through {} {} {}",
+                c.family, c.table, c.name
+            ));
         }
     }
     Ok(changed)
@@ -191,7 +265,13 @@ pub fn diagnose() -> Vec<Finding> {
     check_vms(&mut out);
     check_bans(&mut out);
     if !is_root() {
-        out.push(finding("doctor", Severity::Info, "Partial check", "run `sudo ai-firewall doctor` to also inspect firewall rules and bans", None));
+        out.push(finding(
+            "doctor",
+            Severity::Info,
+            "Partial check",
+            "run `sudo ai-firewall doctor` to also inspect firewall rules and bans",
+            None,
+        ));
     }
     out
 }
@@ -232,7 +312,13 @@ fn check_firewall(out: &mut Vec<Finding>) {
         ));
     }
     if unit_active("firewalld") {
-        out.push(finding("firewall", Severity::Warn, "firewalld is still running", "two firewalls stack their rules", Some("disable-firewalld")));
+        out.push(finding(
+            "firewall",
+            Severity::Warn,
+            "firewalld is still running",
+            "two firewalls stack their rules",
+            Some("disable-firewalld"),
+        ));
     }
 }
 
@@ -243,7 +329,10 @@ fn check_connectivity(out: &mut Vec<Finding>) {
             "network",
             Severity::Fail,
             "Not connected",
-            format!("no default route (NetworkManager: {}); connect to wifi or plug in a cable", nm.trim().if_empty("unknown")),
+            format!(
+                "no default route (NetworkManager: {}); connect to wifi or plug in a cable",
+                nm.trim().if_empty("unknown")
+            ),
             None,
         ));
         return;
@@ -251,7 +340,13 @@ fn check_connectivity(out: &mut Vec<Finding>) {
     let gw = Ipv4Addr::from(gw);
     let internet = reachable("1.1.1.1:443") || reachable("8.8.8.8:53");
     if internet {
-        out.push(finding("network", Severity::Ok, "Internet works", format!("via {iface}, router {gw}"), None));
+        out.push(finding(
+            "network",
+            Severity::Ok,
+            "Internet works",
+            format!("via {iface}, router {gw}"),
+            None,
+        ));
     } else {
         out.push(finding(
             "network",
@@ -263,16 +358,28 @@ fn check_connectivity(out: &mut Vec<Finding>) {
     }
 
     let dns_ok = run("timeout", &["4", "getent", "hosts", "archlinux.org"]).is_some();
-    let servers: Vec<String> = net::nameservers().into_iter().map(|ip| Ipv4Addr::from(ip).to_string()).collect();
+    let servers: Vec<String> = net::nameservers()
+        .into_iter()
+        .map(|ip| Ipv4Addr::from(ip).to_string())
+        .collect();
     if dns_ok {
-        out.push(finding("dns", Severity::Ok, "DNS works", format!("servers: {}", servers.join(" ").if_empty("none listed")), None));
+        out.push(finding(
+            "dns",
+            Severity::Ok,
+            "DNS works",
+            format!("servers: {}", servers.join(" ").if_empty("none listed")),
+            None,
+        ));
     } else if internet {
         let resolved = unit_active("systemd-resolved");
         out.push(finding(
             "dns",
             Severity::Fail,
             "Internet works but names don't resolve",
-            format!("DNS servers {} don't answer", servers.join(" ").if_empty("(none in /etc/resolv.conf)")),
+            format!(
+                "DNS servers {} don't answer",
+                servers.join(" ").if_empty("(none in /etc/resolv.conf)")
+            ),
             resolved.then_some("restart-resolved"),
         ));
     }
@@ -284,7 +391,9 @@ fn check_vms(out: &mut Vec<Finding>) {
         return;
     }
     let list = bridges.join(" ");
-    let forwarding = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward").map(|s| s.trim() == "1").unwrap_or(false);
+    let forwarding = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false);
     if !forwarding {
         out.push(finding(
             "vm",
@@ -306,7 +415,10 @@ fn check_vms(out: &mut Vec<Finding>) {
         let blocking = blocking_forward_chains(&chains, &bridge);
         if !blocking.is_empty() {
             ok = false;
-            let who: Vec<String> = blocking.iter().map(|c| format!("{} {} {}", c.family, c.table, c.name)).collect();
+            let who: Vec<String> = blocking
+                .iter()
+                .map(|c| format!("{} {} {}", c.family, c.table, c.name))
+                .collect();
             let culprit = if chains.iter().any(|c| c.name.starts_with("ufw-")) {
                 "ufw"
             } else if chains.iter().any(|c| c.name.starts_with("DOCKER")) {
@@ -323,12 +435,21 @@ fn check_vms(out: &mut Vec<Finding>) {
             ));
         }
         if bridge.starts_with("virbr") && net::ifindex(&bridge).is_some() {
-            let subnet = net::interface_networks().into_iter().find(|n| n.iface == bridge).map(|n| n.net);
+            let subnet = net::interface_networks()
+                .into_iter()
+                .find(|n| n.iface == bridge)
+                .map(|n| n.net);
             let has_nat = match subnet {
                 Some(n) => {
                     let prefix = Ipv4Addr::from(n.net).to_string();
-                    let prefix = prefix.rsplit_once('.').map(|p| p.0).unwrap_or(&prefix).to_string();
-                    chains.iter().any(|c| c.body.contains("masquerade") && c.body.contains(&prefix))
+                    let prefix = prefix
+                        .rsplit_once('.')
+                        .map(|p| p.0)
+                        .unwrap_or(&prefix)
+                        .to_string();
+                    chains
+                        .iter()
+                        .any(|c| c.body.contains("masquerade") && c.body.contains(&prefix))
                 }
                 None => true,
             };
@@ -345,7 +466,13 @@ fn check_vms(out: &mut Vec<Finding>) {
         }
     }
     if ok {
-        out.push(finding("vm", Severity::Ok, "VM and container networking looks right", format!("bridges: {list}"), None));
+        out.push(finding(
+            "vm",
+            Severity::Ok,
+            "VM and container networking looks right",
+            format!("bridges: {list}"),
+            None,
+        ));
     }
 }
 
@@ -357,14 +484,22 @@ fn check_bans(out: &mut Vec<Finding>) {
         return;
     };
     let guard = protection();
-    let hits: Vec<String> =
-        blocklist.entries().into_iter().map(|e| e.0).filter(|ip| guard.is_protected(*ip)).map(|ip| ip.to_string()).collect();
+    let hits: Vec<String> = blocklist
+        .entries()
+        .into_iter()
+        .map(|e| e.0)
+        .filter(|ip| guard.is_protected(*ip))
+        .map(|ip| ip.to_string())
+        .collect();
     if !hits.is_empty() {
         out.push(finding(
             "firewall",
             Severity::Fail,
             "An address you depend on is banned",
-            format!("{} (router, DNS, this machine or a VM network)", hits.join(" ")),
+            format!(
+                "{} (router, DNS, this machine or a VM network)",
+                hits.join(" ")
+            ),
             Some("unban-protected"),
         ));
     }
@@ -380,7 +515,10 @@ fn sh(cmd: &str, args: &[&str]) -> anyhow::Result<()> {
 
 pub fn apply(id: &str) -> anyhow::Result<String> {
     let Some(action) = action(id) else {
-        anyhow::bail!("unknown fix {id:?}; known fixes: {}", FIXES.iter().map(|f| f.id).collect::<Vec<_>>().join(", "));
+        anyhow::bail!(
+            "unknown fix {id:?}; known fixes: {}",
+            FIXES.iter().map(|f| f.id).collect::<Vec<_>>().join(", ")
+        );
     };
     anyhow::ensure!(is_root(), "fixes need root: run it with sudo");
     action()
@@ -390,12 +528,17 @@ type Action = fn() -> anyhow::Result<String>;
 
 fn action(id: &str) -> Option<Action> {
     let a: Action = match id {
-        "start-firewall" => || sh("systemctl", &["restart", "ai-firewall"]).map(|_| "ai-firewall restarted".into()),
+        "start-firewall" => {
+            || sh("systemctl", &["restart", "ai-firewall"]).map(|_| "ai-firewall restarted".into())
+        }
         "disable-ufw" => || {
             let _ = sh("ufw", &["--force", "disable"]);
-            sh("systemctl", &["disable", "--now", "ufw"]).map(|_| "ufw is off and won't start at boot".into())
+            sh("systemctl", &["disable", "--now", "ufw"])
+                .map(|_| "ufw is off and won't start at boot".into())
         },
-        "disable-firewalld" => || sh("systemctl", &["disable", "--now", "firewalld"]).map(|_| "firewalld is off".into()),
+        "disable-firewalld" => || {
+            sh("systemctl", &["disable", "--now", "firewalld"]).map(|_| "firewalld is off".into())
+        },
         "enable-forwarding" => || {
             sh("sysctl", &["-qw", "net.ipv4.ip_forward=1"])?;
             state::write_atomic(
@@ -409,19 +552,34 @@ fn action(id: &str) -> Option<Action> {
             Ok(if changed.is_empty() {
                 "nothing was blocking VM bridges".into()
             } else {
-                format!("let {}; ai-firewall keeps these in place", changed.join(", "))
+                format!(
+                    "let {}; ai-firewall keeps these in place",
+                    changed.join(", ")
+                )
             })
         },
         "restart-libvirt-network" => || {
-            let unit = if unit_active("virtnetworkd") { "virtnetworkd" } else { "libvirtd" };
+            let unit = if unit_active("virtnetworkd") {
+                "virtnetworkd"
+            } else {
+                "libvirtd"
+            };
             sh("systemctl", &["restart", unit])?;
             Ok(format!("{unit} restarted; it re-adds its NAT rules"))
         },
-        "restart-resolved" => || sh("systemctl", &["restart", "systemd-resolved"]).map(|_| "systemd-resolved restarted".into()),
+        "restart-resolved" => || {
+            sh("systemctl", &["restart", "systemd-resolved"])
+                .map(|_| "systemd-resolved restarted".into())
+        },
         "unban-protected" => || {
             let mut blocklist = state::open_pinned_blocklist()?;
             let guard = protection();
-            let hits: Vec<_> = blocklist.entries().into_iter().map(|e| e.0).filter(|ip| guard.is_protected(*ip)).collect();
+            let hits: Vec<_> = blocklist
+                .entries()
+                .into_iter()
+                .map(|e| e.0)
+                .filter(|ip| guard.is_protected(*ip))
+                .collect();
             for ip in &hits {
                 blocklist.remove(*ip)?;
             }
@@ -438,13 +596,21 @@ trait IfEmpty {
 
 impl IfEmpty for &str {
     fn if_empty(self, fallback: &str) -> String {
-        if self.is_empty() { fallback.into() } else { self.into() }
+        if self.is_empty() {
+            fallback.into()
+        } else {
+            self.into()
+        }
     }
 }
 
 impl IfEmpty for String {
     fn if_empty(self, fallback: &str) -> String {
-        if self.is_empty() { fallback.into() } else { self }
+        if self.is_empty() {
+            fallback.into()
+        } else {
+            self
+        }
     }
 }
 
@@ -480,7 +646,10 @@ table ip nat {
         assert_eq!(chains.len(), 4);
         let blocking = blocking_forward_chains(&chains, "virbr0");
         assert_eq!(blocking.len(), 1);
-        assert_eq!((blocking[0].table.as_str(), blocking[0].name.as_str()), ("filter", "FORWARD"));
+        assert_eq!(
+            (blocking[0].table.as_str(), blocking[0].name.as_str()),
+            ("filter", "FORWARD")
+        );
         assert!(chains[3].body.contains("masquerade"));
     }
 
@@ -500,6 +669,11 @@ table ip nat {
             assert!(action(f.id).is_some(), "{} not handled", f.id);
         }
         assert!(action("rm -rf /").is_none());
-        assert!(apply("rm -rf /").unwrap_err().to_string().contains("unknown fix"));
+        assert!(
+            apply("rm -rf /")
+                .unwrap_err()
+                .to_string()
+                .contains("unknown fix")
+        );
     }
 }

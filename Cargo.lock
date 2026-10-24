@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "ai-firewall"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ai-firewall-common",
  "ai-firewall-ebpf",
@@ -33,18 +33,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
 name = "ai-firewall-common"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aya",
 ]
 
 [[package]]
 name = "ai-firewall-ebpf"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ai-firewall-common",
  "aya-ebpf",

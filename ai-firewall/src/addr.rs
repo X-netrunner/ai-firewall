@@ -3,11 +3,14 @@
 // whole /64, so banning a single v6 address would be trivial to dodge)
 //---------------------------
 
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    str::FromStr,
+};
+
 use ai_firewall_common::{FAMILY_V6, PacketEvent};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::str::FromStr;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Src {
@@ -17,7 +20,11 @@ pub enum Src {
 
 impl Src {
     pub fn of(ev: &PacketEvent) -> Self {
-        if ev.family == FAMILY_V6 { Src::V6(ev.src6) } else { Src::V4(ev.src_ip) }
+        if ev.family == FAMILY_V6 {
+            Src::V6(ev.src6)
+        } else {
+            Src::V4(ev.src_ip)
+        }
     }
 
     pub fn v6_prefix(ip: Ipv6Addr) -> u64 {
@@ -56,7 +63,9 @@ impl Serialize for Src {
 
 impl<'de> Deserialize<'de> for Src {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        String::deserialize(d)?.parse().map_err(serde::de::Error::custom)
+        String::deserialize(d)?
+            .parse()
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -70,7 +79,10 @@ mod tests {
             assert_eq!(s.parse::<Src>().unwrap().to_string(), s);
         }
         // a full v6 address bans its /64
-        assert_eq!("2001:db8:1:2:aaaa::1".parse::<Src>().unwrap().to_string(), "2001:db8:1:2::/64");
+        assert_eq!(
+            "2001:db8:1:2:aaaa::1".parse::<Src>().unwrap().to_string(),
+            "2001:db8:1:2::/64"
+        );
         assert!("10.0.0.5/64".parse::<Src>().is_err());
         assert!("nope".parse::<Src>().is_err());
     }

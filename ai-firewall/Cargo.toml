@@ -1,6 +1,6 @@
 [package]
 name = "ai-firewall"
-version = "0.1.0"
+version = "0.2.0"
 edition.workspace = true
 
 license.workspace = true
@@ -26,6 +26,7 @@ clap = { workspace = true, features = ["derive", "usage", "error-context"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 toml = "0.8"
+toml_edit = "0.22"
 ratatui = { version = "0.30", default-features = false, features = ["crossterm", "layout-cache"] }
 [build-dependencies]
 anyhow = { workspace = true }

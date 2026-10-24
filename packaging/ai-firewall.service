@@ -18,13 +18,30 @@ RestartSec=2
 StateDirectory=ai-firewall
 RuntimeDirectory=ai-firewall
 ConfigurationDirectory=ai-firewall
-CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_RESOURCE
+# SETUID/SETGID: runuser, to show ban notifications on your desktop as you
+CapabilityBoundingSet=CAP_BPF CAP_NET_ADMIN CAP_PERFMON CAP_SYS_ADMIN CAP_SYS_RESOURCE CAP_SETUID CAP_SETGID
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/sys/fs/bpf
 ProtectHome=yes
 PrivateTmp=yes
 MemoryMax=64M
+# Everything below is off-limits to the daemon (and to what it starts: nft, curl, nmcli, runuser).
+# Not set on purpose: ProtectKernelTunables (makes /sys/fs/bpf read-only), PrivateNetwork (it is a
+# firewall), SystemCallFilter (bpf() moves between syscall groups across systemd versions).
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelLogs=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
 WantedBy=multi-user.target

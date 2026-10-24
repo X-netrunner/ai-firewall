@@ -2,15 +2,18 @@
 // 5.1 Ban records, the pinned kernel blocklist, and what survives a reboot
 //---------------------------
 
-use crate::detector::Offender;
-use crate::net::{boot_ns, boot_secs, unix_secs};
+use std::{collections::HashMap as StdHashMap, path::Path};
+
 use ai_firewall_common::BAN_FOREVER;
+use anyhow::Context as _;
 use aya::maps::{HashMap, Map, MapData};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap as StdHashMap;
-use crate::addr::Src;
-use anyhow::Context as _;
-use std::path::Path;
+
+use crate::{
+    addr::Src,
+    detector::Offender,
+    net::{boot_ns, boot_secs, unix_secs},
+};
 
 pub const PIN_DIR: &str = "/sys/fs/bpf/ai-firewall";
 pub const STATE_FILE: &str = "/var/lib/ai-firewall/state.json";
@@ -30,7 +33,11 @@ impl Blocklist {
     pub fn insert(&mut self, src: Src, expiry: u64) -> anyhow::Result<()> {
         match src {
             Src::V4(ip) => self.v4.insert(ip, expiry, 0)?,
-            Src::V6(p) => self.v6.as_mut().context("this build has no IPv6 ban map")?.insert(p, expiry, 0)?,
+            Src::V6(p) => self
+                .v6
+                .as_mut()
+                .context("this build has no IPv6 ban map")?
+                .insert(p, expiry, 0)?,
         }
         Ok(())
     }
@@ -38,7 +45,11 @@ impl Blocklist {
     pub fn remove(&mut self, src: Src) -> anyhow::Result<()> {
         match src {
             Src::V4(ip) => self.v4.remove(&ip)?,
-            Src::V6(p) => self.v6.as_mut().context("this build has no IPv6 ban map")?.remove(&p)?,
+            Src::V6(p) => self
+                .v6
+                .as_mut()
+                .context("this build has no IPv6 ban map")?
+                .remove(&p)?,
         }
         Ok(())
     }
@@ -52,9 +63,18 @@ impl Blocklist {
 
     /// Every (source, kernel expiry) currently in the maps
     pub fn entries(&self) -> Vec<(Src, u64)> {
-        let mut out: Vec<(Src, u64)> = self.v4.iter().filter_map(Result::ok).map(|(ip, e)| (Src::V4(ip), e)).collect();
+        let mut out: Vec<(Src, u64)> = self
+            .v4
+            .iter()
+            .filter_map(Result::ok)
+            .map(|(ip, e)| (Src::V4(ip), e))
+            .collect();
         if let Some(m) = &self.v6 {
-            out.extend(m.iter().filter_map(Result::ok).map(|(p, e)| (Src::V6(p), e)));
+            out.extend(
+                m.iter()
+                    .filter_map(Result::ok)
+                    .map(|(p, e)| (Src::V6(p), e)),
+            );
         }
         out
     }
@@ -68,12 +88,19 @@ fn open_pinned<K: aya::Pod, V: aya::Pod>(name: &str) -> anyhow::Result<HashMap<M
 
 /// Opens the blocklist the daemon pinned, so the CLI works without talking to it
 pub fn open_pinned_blocklist() -> anyhow::Result<Blocklist> {
-    Ok(Blocklist::new(open_pinned("BLOCKLIST")?, open_pinned("BLOCKLIST6").ok()))
+    Ok(Blocklist::new(
+        open_pinned("BLOCKLIST")?,
+        open_pinned("BLOCKLIST6").ok(),
+    ))
 }
 
 /// Kernel expiry value for a ban lasting `secs` (0 = forever)
 pub fn expiry_for(secs: u64) -> u64 {
-    if secs == 0 { BAN_FOREVER } else { boot_ns() + secs * 1_000_000_000 }
+    if secs == 0 {
+        BAN_FOREVER
+    } else {
+        boot_ns() + secs * 1_000_000_000
+    }
 }
 
 /// Seconds left on a kernel expiry value, None if already expired, Some(0) if forever
@@ -163,7 +190,11 @@ impl Saved {
 }
 
 pub fn manual_record() -> BanRecord {
-    BanRecord { reason: "banned by hand".into(), source: "manual".into(), strikes: 0 }
+    BanRecord {
+        reason: "banned by hand".into(),
+        source: "manual".into(),
+        strikes: 0,
+    }
 }
 
 pub fn write_atomic(path: &Path, data: &[u8]) -> anyhow::Result<()> {

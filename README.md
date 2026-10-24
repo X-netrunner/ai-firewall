@@ -37,6 +37,28 @@ sources that scan or flood you get banned by themselves.
   - systemd restarts the daemon if it ever exits
   - a broken config edit is rejected and the last good config stays in force
 
+## Rules, feeds, profiles
+
+All in `/etc/ai-firewall/config.toml` (the default config explains each one):
+- **Port ranges:** `allow_tcp = [22, "1714-1764"]`.
+- **Narrower rules:** a port open only to some addresses, and / or a limit on new connections per source:
+  ```toml
+  [[rule]]
+  proto = "tcp"
+  port = 22
+  from = "192.168.1.0/24"
+  limit = "6/30s"
+  ```
+  A source that goes over the limit has its new connections dropped, and the drops count towards a ban.
+- **Blocklist feeds:** `[feeds] lists = ["spamhaus-drop", "firehol-level1"]`, plus your own `urls`. The
+  daemon downloads them with curl, caches them in `/var/lib/ai-firewall/feeds` and refreshes them every
+  `refresh_hours`. Private and LAN ranges are always taken out. `sudo ai-firewall feeds --refresh` downloads them now.
+- **Network profiles:** `[profiles.home] networks = ["MyHomeWifi"]` with its own `allow_tcp` / `allow_udp` /
+  `allow_ping` / rules, picked by the active NetworkManager connection name.
+- **Notifications and history:** bans pop up on your desktop (grouped when several come at once; turn them off
+  with `[notify] bans = false`). `ai-firewall history` lists bans, lifts, profile switches and feed updates
+  (`/var/lib/ai-firewall/history.jsonl`).
+
 ## Doctor
 
 `ai-firewall doctor` checks, with plain rules and no AI:
@@ -50,6 +72,16 @@ Each problem it can fix comes with a fix id. `ai-firewall fix <id>` is the only 
 apply one, so that list of ids is everything an assistant can be allowed to do.
 `--json` gives machine-readable output. With `keep_vm_forwarding = true` (the default),
 the daemon puts the VM exception back whenever Docker restarts.
+
+## Ask the firewall
+
+Press `a` in `ai-firewall top`, or run `ai-firewall ask "why can't my VM reach the internet?"`.
+A local model answers from fresh facts: doctor findings, status, recent log lines and
+host details. It uses LUNA's model when LUNA is set up, otherwise Ollama; remote models
+are refused, so nothing about your network leaves the machine. It can only suggest
+actions from a fixed list (doctor fixes, `open`/`close` a port, `unban`), and nothing
+runs until you confirm. With no model installed you get the doctor's findings instead.
+Run it with sudo so it can also see firewall rules and bans.
 
 ## Install (replaces ufw)
 
@@ -66,6 +98,9 @@ To try it without dropping anything, set `mode = "monitor"`: it only logs what i
 sudo ai-firewall ban 203.0.113.7 --minutes 30   # 0 = until unbanned
 sudo ai-firewall unban 203.0.113.7
 sudo ai-firewall off                            # stop filtering completely
+sudo ai-firewall open tcp 22                    # open a port or range (edits the config, keeps comments)
+ai-firewall history                             # what it did lately
+ai-firewall feeds                               # the blocklists in use
 sudo ai-firewall top                            # live dashboard (Halcyon colours)
 sudo ai-firewall doctor --fix                   # why is the net / my VM broken? fix it
 journalctl -u ai-firewall -f                    # live detections

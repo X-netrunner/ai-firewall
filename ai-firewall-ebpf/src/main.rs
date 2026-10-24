@@ -7,19 +7,18 @@
 
 use ai_firewall_common::{
     BAN_FOREVER, CFG_DROP_PING, CFG_ENFORCE, CFG_EPHEMERAL_LOW, CFG_LEN, CFG_UDP_STRICT, FAMILY_V4,
-    FAMILY_V6, PROTO_TCP, PROTO_UDP, PacketEvent, STAT_DROP_BLOCKLIST, STAT_DROP_POLICY,
-    STAT_EVENTS_LOST, STAT_LEN, STAT_PASSED, TCP_FLAG_ACK, TCP_FLAG_FIN, TCP_FLAG_PSH,
-    TCP_FLAG_RST, TCP_FLAG_SYN, TCP_FLAG_URG, UDP_FLOW_TTL_NS, UdpFlow, UdpFlow6,
+    FAMILY_V6, PROTO_TCP, PROTO_UDP, PacketEvent, RateState, RuleKey, STAT_DROP_BLOCKLIST,
+    STAT_DROP_POLICY, STAT_EVENTS_LOST, STAT_LEN, STAT_PASSED, TCP_FLAG_ACK, TCP_FLAG_FIN,
+    TCP_FLAG_PSH, TCP_FLAG_RST, TCP_FLAG_SYN, TCP_FLAG_URG, UDP_FLOW_TTL_NS, UdpFlow, UdpFlow6,
     VERDICT_DROP_POLICY, VERDICT_PASS,
 };
 use aya_ebpf::{
     bindings::{TC_ACT_UNSPEC, xdp_action},
     helpers::bpf_ktime_get_boot_ns,
     macros::{classifier, map, xdp},
-    maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
+    maps::{Array, HashMap, LpmTrie, LruHashMap, PerCpuArray, RingBuf, lpm_trie::Key},
     programs::{TcContext, XdpContext},
 };
-
 use network_types::{
     eth::{EthHdr, EtherType},
     ip::{IpProto, Ipv4Hdr, Ipv6Hdr},
@@ -52,7 +51,23 @@ static TCP_ALLOW: Array<u8> = Array::<u8>::with_max_entries(65536, 0);
 #[map]
 static UDP_ALLOW: Array<u8> = Array::<u8>::with_max_entries(65536, 0);
 
-/// Metrics map
+// 11.1 "allow <port> from <cidr>" (IPv4), one trie per protocol
+#[map]
+static ALLOW_FROM_TCP: LpmTrie<RuleKey, u8> = LpmTrie::<RuleKey, u8>::with_max_entries(4096, 0);
+#[map]
+static ALLOW_FROM_UDP: LpmTrie<RuleKey, u8> = LpmTrie::<RuleKey, u8>::with_max_entries(4096, 0);
+
+// 11.1 Per-port limit on new TCP connections from one source (brute-force guard)
+#[map]
+static TCP_RATE: Array<u32> = Array::<u32>::with_max_entries(65536, 0);
+#[map]
+static RATE_STATE: LruHashMap<u64, RateState> =
+    LruHashMap::<u64, RateState>::with_max_entries(65536, 0);
+
+// 11.2 Blocklist feeds: known-bad IPv4 networks (Spamhaus DROP, FireHOL ...), loaded by userspace
+#[map]
+static FEEDS: LpmTrie<[u8; 4], u8> = LpmTrie::<[u8; 4], u8>::with_max_entries(131072, 0);
+
 #[map]
 static CONFIG: Array<u32> = Array::<u32>::with_max_entries(CFG_LEN, 0);
 
@@ -145,6 +160,10 @@ fn try_ai_firewall(ctx: &XdpContext) -> Result<u32, ()> {
                 bump(STAT_DROP_BLOCKLIST);
                 return Ok(xdp_action::XDP_DROP);
             }
+            if FEEDS.get(Key::new(32, src_ip.to_be_bytes())).is_some() {
+                bump(STAT_DROP_BLOCKLIST);
+                return Ok(xdp_action::XDP_DROP);
+            }
 
             // Non-first fragments carry no L4 header
             if u16::from_be(ip_hdr.frag_off) & 0x1fff != 0 {
@@ -165,11 +184,23 @@ fn try_ai_firewall(ctx: &XdpContext) -> Result<u32, ()> {
                 return Ok(xdp_action::XDP_PASS);
             };
             let reply = flow.proto == PROTO_UDP && {
-                let exact = UdpFlow { remote_ip: src_ip, local_port: flow.dst_port, remote_port: flow.src_port };
-                let any = UdpFlow { remote_ip: 0, local_port: flow.dst_port, remote_port: 0 };
+                let exact = UdpFlow {
+                    remote_ip: src_ip,
+                    local_port: flow.dst_port,
+                    remote_port: flow.src_port,
+                };
+                let any = UdpFlow {
+                    remote_ip: 0,
+                    local_port: flow.dst_port,
+                    remote_port: 0,
+                };
                 live(unsafe { UDP_FLOWS.get(&exact) }) || live(unsafe { UDP_FLOWS.get(&any) })
             };
-            let src = Source { family: FAMILY_V4, v4: src_ip, v6: 0 };
+            let src = Source {
+                family: FAMILY_V4,
+                v4: src_ip,
+                v6: 0,
+            };
             Ok(policy(&src, &flow, to_everyone, reply))
         }
         EtherType::Ipv6 => {
@@ -178,7 +209,9 @@ fn try_ai_firewall(ctx: &XdpContext) -> Result<u32, ()> {
             }
             let ip_hdr = unsafe { &*(ip_start as *const Ipv6Hdr) };
             let src = unsafe { ip_hdr.src_addr.in6_u.u6_addr8 };
-            let prefix = u64::from_be_bytes([src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7]]);
+            let prefix = u64::from_be_bytes([
+                src[0], src[1], src[2], src[3], src[4], src[5], src[6], src[7],
+            ]);
 
             if live(unsafe { BLOCKLIST6.get(&prefix) }) {
                 bump(STAT_DROP_BLOCKLIST);
@@ -196,11 +229,23 @@ fn try_ai_firewall(ctx: &XdpContext) -> Result<u32, ()> {
                 return Ok(xdp_action::XDP_PASS);
             };
             let reply = flow.proto == PROTO_UDP && {
-                let exact = UdpFlow6 { remote_ip: src, local_port: flow.dst_port, remote_port: flow.src_port };
-                let any = UdpFlow6 { remote_ip: [0; 16], local_port: flow.dst_port, remote_port: 0 };
+                let exact = UdpFlow6 {
+                    remote_ip: src,
+                    local_port: flow.dst_port,
+                    remote_port: flow.src_port,
+                };
+                let any = UdpFlow6 {
+                    remote_ip: [0; 16],
+                    local_port: flow.dst_port,
+                    remote_port: 0,
+                };
                 live(unsafe { UDP_FLOWS6.get(&exact) }) || live(unsafe { UDP_FLOWS6.get(&any) })
             };
-            let source = Source { family: FAMILY_V6, v4: 0, v6: prefix };
+            let source = Source {
+                family: FAMILY_V6,
+                v4: 0,
+                v6: prefix,
+            };
             Ok(policy(&source, &flow, to_everyone, reply))
         }
         _ => Ok(xdp_action::XDP_PASS),
@@ -247,7 +292,11 @@ fn parse_l4(proto: u8, l4: usize, end: usize) -> Option<Flow> {
             tcp_flags |= TCP_FLAG_URG;
         }
         let data_start = l4 + ((tcp_hdr.doff() & 0x0f) as usize) * 4;
-        let payload_len = if data_start <= end { (end - data_start) as u16 } else { 0 };
+        let payload_len = if data_start <= end {
+            (end - data_start) as u16
+        } else {
+            0
+        };
         Some(Flow {
             proto: PROTO_TCP,
             src_port: u16::from_be(tcp_hdr.source),
@@ -277,24 +326,83 @@ fn parse_l4(proto: u8, l4: usize, end: usize) -> Option<Flow> {
 ///   segment belongs to a connection the kernel stack will vet (and RST if unknown).
 /// - UDP: open ports, plus replies to flows we started (seen by the egress program).
 ///   With udp_strict off, anything to an ephemeral port counts as a reply instead.
+#[inline(always)]
+fn allowed_from(trie: &LpmTrie<RuleKey, u8>, src: &Source, port: u16) -> bool {
+    if src.family != FAMILY_V4 {
+        return false;
+    }
+    let p = port.to_be_bytes();
+    let a = src.v4.to_be_bytes();
+    trie.get(Key::new(48, [p[0], p[1], a[0], a[1], a[2], a[3]]))
+        .is_some()
+}
+
+/// true when this new connection goes over the port's limit for this source
+#[inline(always)]
+fn over_rate(src: &Source, port: u16) -> bool {
+    let packed = TCP_RATE.get(port as u32).copied().unwrap_or(0);
+    if packed == 0 || src.family != FAMILY_V4 {
+        return false;
+    }
+    let max = packed >> 16;
+    let window = (packed & 0xffff) as u64 * 1_000_000_000;
+    let key = ((src.v4 as u64) << 16) | port as u64;
+    let t = now();
+    match RATE_STATE.get_ptr_mut(&key) {
+        Some(st) => {
+            let st = unsafe { &mut *st };
+            if t - st.window_start > window {
+                st.window_start = t;
+                st.count = 1;
+                false
+            } else {
+                st.count += 1;
+                st.count > max
+            }
+        }
+        None => {
+            let _ = RATE_STATE.insert(
+                &key,
+                &RateState {
+                    window_start: t,
+                    count: 1,
+                    _pad: 0,
+                },
+                0,
+            );
+            false
+        }
+    }
+}
+
 fn policy(src: &Source, flow: &Flow, to_everyone: bool, reply: bool) -> u32 {
     let (interesting, allowed) = if flow.proto == PROTO_TCP {
         let f = flow.tcp_flags;
         let opener = (f & TCP_FLAG_SYN) != 0 && (f & TCP_FLAG_ACK) == 0;
         let fin_urg_psh = TCP_FLAG_FIN | TCP_FLAG_URG | TCP_FLAG_PSH;
-        let odd = f == 0 || (f & fin_urg_psh) == fin_urg_psh || (f & (TCP_FLAG_FIN | TCP_FLAG_ACK)) == TCP_FLAG_FIN;
+        let odd = f == 0
+            || (f & fin_urg_psh) == fin_urg_psh
+            || (f & (TCP_FLAG_FIN | TCP_FLAG_ACK)) == TCP_FLAG_FIN;
         if odd {
             // Null / Xmas / FIN scans: never part of a real connection
             (true, false)
         } else if opener {
-            (true, port_open(&TCP_ALLOW, flow.dst_port))
+            let open = port_open(&TCP_ALLOW, flow.dst_port)
+                || allowed_from(&ALLOW_FROM_TCP, src, flow.dst_port);
+            (true, open && !over_rate(src, flow.dst_port))
         } else {
             (false, true)
         }
     } else {
-        let loose_reply = config(CFG_UDP_STRICT) == 0 && (flow.dst_port as u32) >= config(CFG_EPHEMERAL_LOW);
+        let loose_reply =
+            config(CFG_UDP_STRICT) == 0 && (flow.dst_port as u32) >= config(CFG_EPHEMERAL_LOW);
         let reply = reply || loose_reply;
-        (!reply, reply || port_open(&UDP_ALLOW, flow.dst_port))
+        (
+            !reply,
+            reply
+                || port_open(&UDP_ALLOW, flow.dst_port)
+                || allowed_from(&ALLOW_FROM_UDP, src, flow.dst_port),
+        )
     };
 
     let drop = !allowed && config(CFG_ENFORCE) != 0;
@@ -310,7 +418,11 @@ fn policy(src: &Source, flow: &Flow, to_everyone: bool, reply: bool) -> u32 {
                     protocol: flow.proto,
                     tcp_flags: flow.tcp_flags,
                     payload_len: flow.payload_len,
-                    verdict: if allowed { VERDICT_PASS } else { VERDICT_DROP_POLICY },
+                    verdict: if allowed {
+                        VERDICT_PASS
+                    } else {
+                        VERDICT_DROP_POLICY
+                    },
                     family: src.family,
                     _pad: [0; 2],
                 });
@@ -354,9 +466,17 @@ fn try_egress(ctx: &TcContext) -> Result<(), i64> {
             let dst = u32::from_be(ip.dst_addr);
             let local_port = u16::from_be(udp.source);
             let key = if to_everyone || dst >> 28 == 0xe || dst == u32::MAX {
-                UdpFlow { remote_ip: 0, local_port, remote_port: 0 }
+                UdpFlow {
+                    remote_ip: 0,
+                    local_port,
+                    remote_port: 0,
+                }
             } else {
-                UdpFlow { remote_ip: dst, local_port, remote_port: u16::from_be(udp.dest) }
+                UdpFlow {
+                    remote_ip: dst,
+                    local_port,
+                    remote_port: u16::from_be(udp.dest),
+                }
             };
             let _ = UDP_FLOWS.insert(&key, &expiry, 0);
         }
@@ -369,9 +489,17 @@ fn try_egress(ctx: &TcContext) -> Result<(), i64> {
             let dst = unsafe { ip.dst_addr.in6_u.u6_addr8 };
             let local_port = u16::from_be(udp.source);
             let key = if to_everyone || dst[0] == 0xff {
-                UdpFlow6 { remote_ip: [0; 16], local_port, remote_port: 0 }
+                UdpFlow6 {
+                    remote_ip: [0; 16],
+                    local_port,
+                    remote_port: 0,
+                }
             } else {
-                UdpFlow6 { remote_ip: dst, local_port, remote_port: u16::from_be(udp.dest) }
+                UdpFlow6 {
+                    remote_ip: dst,
+                    local_port,
+                    remote_port: u16::from_be(udp.dest),
+                }
             };
             let _ = UDP_FLOWS6.insert(&key, &expiry, 0);
         }
