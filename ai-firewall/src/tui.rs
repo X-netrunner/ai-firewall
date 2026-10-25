@@ -28,7 +28,7 @@ use serde::Deserialize;
 use crate::{
     assistant::{self, Action},
     net::unix_secs,
-    state,
+    selftest, state,
 };
 
 const REFRESH: Duration = Duration::from_secs(1);
@@ -60,6 +60,8 @@ pub struct StatusView {
     pub feeds: Vec<FeedView>,
     pub feed_networks: usize,
     pub config_error: Option<String>,
+    #[serde(default)]
+    pub posture: Option<String>,
     pub bans: Vec<BanView>,
     pub recent: Vec<RecentView>,
 }
@@ -117,9 +119,16 @@ impl StatusView {
     }
 
     pub fn alive(&self) -> bool {
-        std::path::Path::new(&format!("/proc/{}", self.pid)).exists()
-            && unix_secs().saturating_sub(self.updated_unix) < 30
+        daemon_alive(self.pid, self.updated_unix, unix_secs())
     }
+}
+
+/// The daemon counts as alive when its status file is under 30 s old and its pid exists. With /proc mounted hidepid
+/// (sysmode lockdown) other users' processes are invisible, so the pid cannot be checked: then the fresh file is the proof.
+pub fn daemon_alive(pid: u32, updated_unix: u64, now: u64) -> bool {
+    let proc_visible = std::path::Path::new("/proc/1").exists();
+    let pid_ok = !proc_visible || std::path::Path::new(&format!("/proc/{pid}")).exists();
+    pid_ok && now.saturating_sub(updated_unix) < 30
 }
 
 pub fn duration(secs: u64) -> String {
@@ -232,6 +241,10 @@ enum ChatMsg {
     Done(String),
     Offline(String, Vec<Action>),
     Error(String),
+    /// Live test results, as text; a model reply may follow
+    Tests(String),
+    /// The worker finished without a model reply
+    Idle,
 }
 
 /// The help panel: a conversation with the local model about this machine
@@ -247,6 +260,8 @@ struct Chat {
     actions: Vec<Action>,
     confirm: Option<usize>,
     model: Option<String>,
+    /// A live test is running (before its results arrive)
+    testing: bool,
 }
 
 impl Chat {
@@ -264,19 +279,7 @@ impl Chat {
         let (tx, rx) = mpsc::channel();
         self.streaming = Some(rx);
         std::thread::spawn(move || match assistant::detect(&assistant::load_config()) {
-            Ok(backend) => {
-                let _ = tx.send(ChatMsg::Backend(format!(
-                    "{} via {}",
-                    backend.model, backend.via
-                )));
-                let result = assistant::ask(&backend, &raw, |piece| {
-                    let _ = tx.send(ChatMsg::Chunk(piece.to_string()));
-                });
-                let _ = tx.send(match result {
-                    Ok(full) => ChatMsg::Done(full),
-                    Err(e) => ChatMsg::Error(format!("{e:#}")),
-                });
-            }
+            Ok(backend) => stream_reply(&backend, &raw, &tx),
             Err(why) => {
                 let (text, actions) = assistant::offline_answer();
                 let _ = tx.send(ChatMsg::Offline(
@@ -285,6 +288,64 @@ impl Chat {
                 ));
             }
         });
+    }
+
+    /// Runs a live test on a worker; with a local model, the model then explains the results
+    fn run_test(&mut self, name: &'static str) {
+        if self.streaming.is_some() {
+            return;
+        }
+        self.input.clear();
+        self.history.push(("user".into(), format!("/test {name}")));
+        self.actions.clear();
+        self.confirm = None;
+        self.current.clear();
+        self.testing = true;
+        let mut raw = self.raw.clone();
+        let (tx, rx) = mpsc::channel();
+        self.streaming = Some(rx);
+        std::thread::spawn(move || {
+            let text = selftest::run(name, selftest::DEFAULT_TRAFFIC_SECS)
+                .iter()
+                .map(|r| r.text())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let _ = tx.send(ChatMsg::Tests(text.clone()));
+            match assistant::detect(&assistant::load_config()) {
+                Ok(backend) => {
+                    raw.push(("user".into(), format!("Live test results:\n{text}")));
+                    stream_reply(&backend, &raw, &tx);
+                }
+                Err(_) => {
+                    let _ = tx.send(ChatMsg::Idle);
+                }
+            }
+        });
+    }
+
+    /// `/test` or `/test <name>` typed into the panel
+    fn typed_test(&self) -> Option<Result<&'static str, String>> {
+        let rest = self.input.trim().strip_prefix("/test")?;
+        let name = match rest.trim() {
+            "" | "all" => return Some(Ok("all")),
+            n => n,
+        };
+        Some(
+            selftest::TESTS
+                .iter()
+                .find(|t| t.0 == name)
+                .map(|t| t.0)
+                .ok_or_else(|| {
+                    format!(
+                        "unknown test {name:?}; known: all, {}",
+                        selftest::TESTS
+                            .iter()
+                            .map(|t| t.0)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                }),
+        )
     }
 
     /// Drains whatever the worker sent; returns true while still streaming
@@ -302,6 +363,17 @@ impl Chat {
                 ChatMsg::Error(e) => {
                     finished = Some((format!("The model failed: {e}"), Some(Vec::new())))
                 }
+                ChatMsg::Tests(text) => {
+                    self.testing = false;
+                    self.raw
+                        .push(("user".into(), format!("Live test results:\n{text}")));
+                    self.history.push(("test".into(), text));
+                }
+                ChatMsg::Idle => {
+                    self.testing = false;
+                    self.streaming = None;
+                    return false;
+                }
             }
         }
         if let Some((text, actions)) = finished {
@@ -314,6 +386,24 @@ impl Chat {
         }
         self.streaming.is_some()
     }
+}
+
+fn stream_reply(
+    backend: &assistant::Backend,
+    raw: &[(String, String)],
+    tx: &mpsc::Sender<ChatMsg>,
+) {
+    let _ = tx.send(ChatMsg::Backend(format!(
+        "{} via {}",
+        backend.model, backend.via
+    )));
+    let result = assistant::ask(backend, raw, |piece| {
+        let _ = tx.send(ChatMsg::Chunk(piece.to_string()));
+    });
+    let _ = tx.send(match result {
+        Ok(full) => ChatMsg::Done(full),
+        Err(e) => ChatMsg::Error(format!("{e:#}")),
+    });
 }
 
 struct App {
@@ -427,7 +517,14 @@ fn event_loop(terminal: &mut DefaultTerminal, ask: bool) -> anyhow::Result<()> {
                     }
                     match key.code {
                         KeyCode::Esc => app.chat = None,
-                        KeyCode::Enter => chat.send(),
+                        KeyCode::Enter => match chat.typed_test() {
+                            Some(Ok(name)) => chat.run_test(name),
+                            Some(Err(e)) => {
+                                chat.input.clear();
+                                app.say(e, false);
+                            }
+                            None => chat.send(),
+                        },
                         KeyCode::Backspace => {
                             chat.input.pop();
                         }
@@ -435,7 +532,10 @@ fn event_loop(terminal: &mut DefaultTerminal, ask: bool) -> anyhow::Result<()> {
                             if chat.input.is_empty() && c.is_ascii_digit() && c != '0' =>
                         {
                             let i = c as usize - '1' as usize;
-                            if i < chat.actions.len() {
+                            if let Some(Action::Test(name)) = chat.actions.get(i) {
+                                let name = *name;
+                                chat.run_test(name);
+                            } else if i < chat.actions.len() {
                                 chat.confirm = Some(i);
                             } else {
                                 chat.input.push(c);
@@ -563,10 +663,11 @@ fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     f.render_widget(Block::default().style(Style::default().bg(pal.bg)), area);
 
+    let chatting = app.chat.is_some();
     let [header, tiles, graph, body, footer] = Layout::vertical([
-        Constraint::Length(3),
         Constraint::Length(4),
-        Constraint::Length(6),
+        Constraint::Length(4),
+        Constraint::Length(if chatting { 0 } else { 6 }),
         Constraint::Min(6),
         Constraint::Length(1),
     ])
@@ -635,6 +736,7 @@ fn draw(f: &mut Frame, app: &mut App) {
     ];
     for (area, (label, value, sub, color)) in tile_areas.iter().zip(tiles_data) {
         let p = Paragraph::new(vec![
+            Line::from(Span::styled(label, Style::default().fg(pal.muted))),
             Line::from(vec![
                 Span::styled(
                     value,
@@ -642,7 +744,6 @@ fn draw(f: &mut Frame, app: &mut App) {
                 ),
                 Span::styled(format!("  {sub}"), Style::default().fg(pal.muted)),
             ]),
-            Line::from(Span::styled(label, Style::default().fg(pal.muted))),
         ])
         .block(
             Block::default()
@@ -659,18 +760,20 @@ fn draw(f: &mut Frame, app: &mut App) {
     let shown = &drops[drops.len().saturating_sub(width)..];
     let peak = shown.iter().copied().max().unwrap_or(0);
     let title = format!(
-        "drops per second, last {}  (peak {peak})",
+        "drops/s · {} · peak {peak}",
         duration(shown.len().max(1) as u64)
     );
-    f.render_widget(
-        Sparkline::default()
-            .block(pane(&title, &pal))
-            .data(shown)
-            .style(Style::default().fg(pal.accent)),
-        graph,
-    );
+    if !chatting {
+        f.render_widget(
+            Sparkline::default()
+                .block(pane(&title, &pal))
+                .data(shown)
+                .style(Style::default().fg(pal.accent)),
+            graph,
+        );
+    }
 
-    if app.chat.is_some() {
+    if chatting {
         draw_chat(f, body, app);
         draw_footer(f, footer, app);
         return;
@@ -833,9 +936,19 @@ fn draw_header(f: &mut Frame, area: Rect, pal: &Pal, s: Option<&StatusView>) {
                 Style::default().fg(pal.accent),
             ));
         }
+        if let Some(p) = s.posture.as_deref().filter(|p| *p != "secure") {
+            spans.push(Span::styled(
+                format!(" · {p}"),
+                Style::default().fg(if p == "lockdown" {
+                    pal.bad
+                } else {
+                    pal.accent2
+                }),
+            ));
+        }
         if s.config_error.is_some() {
             spans.push(Span::styled(
-                "  ⚠ config error, last good config in force (ai-firewall check)",
+                "  ⚠ config error · last good config in force",
                 Style::default().fg(pal.bad).add_modifier(Modifier::BOLD),
             ));
         }
@@ -849,15 +962,15 @@ fn draw_header(f: &mut Frame, area: Rect, pal: &Pal, s: Option<&StatusView>) {
             }
         };
         Line::from(vec![
-            Span::styled(" open tcp ", Style::default().fg(pal.muted)),
+            Span::styled(" tcp ", Style::default().fg(pal.muted)),
             Span::styled(fmt(&s.allow_tcp), Style::default().fg(pal.text)),
-            Span::styled("   udp ", Style::default().fg(pal.muted)),
+            Span::styled("  ·  udp ", Style::default().fg(pal.muted)),
             Span::styled(fmt(&s.allow_udp), Style::default().fg(pal.text)),
             Span::styled(
                 if s.udp_strict {
-                    "   replies tracked"
+                    "  ·  replies tracked"
                 } else {
-                    "   replies by port range"
+                    "  ·  replies by port range"
                 },
                 Style::default().fg(pal.muted),
             ),
@@ -906,11 +1019,14 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
         return;
     };
     let title = match &chat.model {
-        Some(m) => format!("ask the firewall · {m}"),
-        None => "ask the firewall".to_string(),
+        Some(m) => format!("ask · {m}"),
+        None => "ask".to_string(),
     };
     let block = pane(&title, &pal);
-    let inner = block.inner(area);
+    let inner = block.inner(area).inner(ratatui::layout::Margin {
+        horizontal: 1,
+        vertical: 0,
+    });
     f.render_widget(block, area);
 
     let action_rows = chat.actions.len().min(5) as u16;
@@ -921,36 +1037,32 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
     ])
     .areas(inner);
 
-    let width = log.width.saturating_sub(2) as usize;
+    let width = log.width.saturating_sub(1) as usize;
     let mut lines: Vec<Line> = Vec::new();
-    if chat.history.is_empty() && chat.streaming.is_none() {
-        for hint in [
-            "Ask anything about your network or this firewall, for example:",
-            "  why can't my VM reach the internet?",
-            "  I want to ssh into this laptop from my phone",
-            "  why was 10.67.2.249 banned?",
-            "",
-            "It answers from live facts (doctor checks, status, logs) using a local model,",
-            "and can only suggest actions from a fixed list. Nothing runs until you press y.",
-        ] {
-            lines.push(Line::from(Span::styled(
-                hint,
-                Style::default().fg(pal.muted),
-            )));
-        }
-    }
     let turn = |role: &str, text: &str, lines: &mut Vec<Line>| {
-        let (who, color) = if role == "user" {
-            ("you", pal.accent2)
-        } else {
-            ("firewall", pal.accent)
-        };
-        lines.push(Line::from(Span::styled(
-            who.to_string(),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        )));
-        for l in wrap(text, width) {
-            lines.push(Line::from(Span::styled(l, Style::default().fg(pal.text))));
+        match role {
+            "user" => {
+                for (i, l) in wrap(text, width.saturating_sub(2)).into_iter().enumerate() {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            if i == 0 { "› " } else { "  " },
+                            Style::default().fg(pal.accent2),
+                        ),
+                        Span::styled(
+                            l,
+                            Style::default()
+                                .fg(pal.accent2)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ]));
+                }
+            }
+            "test" => test_lines(text, width, &pal, lines),
+            _ => {
+                for l in wrap(text, width) {
+                    lines.push(Line::from(Span::styled(l, Style::default().fg(pal.text))));
+                }
+            }
         }
         lines.push(Line::from(""));
     };
@@ -959,12 +1071,19 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
     }
     if chat.streaming.is_some() {
         let shown = assistant::strip_actions(&chat.current);
-        let text = if shown.is_empty() {
-            "thinking…".to_string()
+        if chat.testing {
+            lines.push(Line::from(Span::styled(
+                "testing…",
+                Style::default().fg(pal.muted),
+            )));
+        } else if shown.is_empty() {
+            lines.push(Line::from(Span::styled(
+                "thinking…",
+                Style::default().fg(pal.muted),
+            )));
         } else {
-            format!("{shown}▍")
-        };
-        turn("assistant", &text, &mut lines);
+            turn("assistant", &format!("{shown}▍"), &mut lines);
+        }
     }
     let skip = lines.len().saturating_sub(log.height as usize);
     f.render_widget(
@@ -973,19 +1092,18 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
     );
 
     if action_rows > 0 {
-        let mut rows = vec![Line::from(Span::styled(
-            "suggested (press the number):",
-            Style::default().fg(pal.muted),
-        ))];
+        let mut rows = vec![Line::from("")];
         for (i, a) in chat.actions.iter().take(5).enumerate() {
             let selected = chat.confirm == Some(i);
+            let (fg, bg) = if selected {
+                (pal.bg, pal.warn)
+            } else {
+                (pal.bg, pal.accent)
+            };
             rows.push(Line::from(vec![
                 Span::styled(
                     format!(" {} ", i + 1),
-                    Style::default()
-                        .fg(pal.bg)
-                        .bg(pal.accent)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!(" {}", a.describe()),
@@ -993,33 +1111,71 @@ fn draw_chat(f: &mut Frame, area: Rect, app: &App) {
                 ),
                 Span::styled(
                     if selected {
-                        format!("   apply? y / n   (ai-firewall {})", a.args().join(" "))
+                        "   y / n".to_string()
                     } else {
                         String::new()
                     },
-                    Style::default().fg(pal.warn),
+                    Style::default().fg(pal.warn).add_modifier(Modifier::BOLD),
                 ),
             ]));
         }
         f.render_widget(Paragraph::new(rows), actions);
     }
 
-    let prompt = if chat.streaming.is_some() {
-        "  …"
-    } else {
-        "› "
-    };
+    let rule = "─".repeat(input.width as usize);
+    let busy = chat.streaming.is_some();
     f.render_widget(
         Paragraph::new(vec![
-            Line::from(""),
+            Line::from(Span::styled(rule, Style::default().fg(pal.surface_hi))),
             Line::from(vec![
-                Span::styled(prompt, Style::default().fg(pal.accent)),
+                Span::styled(
+                    if busy { "… " } else { "› " },
+                    Style::default().fg(pal.accent).add_modifier(Modifier::BOLD),
+                ),
                 Span::styled(chat.input.clone(), Style::default().fg(pal.text)),
-                Span::styled("▏", Style::default().fg(pal.accent)),
+                Span::styled(if busy { "" } else { "▏" }, Style::default().fg(pal.accent)),
             ]),
         ]),
         input,
     );
+}
+
+/// Test results: a ✓ / ✗ headline per test, then its stats as label / value rows
+fn test_lines(text: &str, width: usize, pal: &Pal, lines: &mut Vec<Line>) {
+    for l in text.lines() {
+        if l.trim().is_empty() {
+            continue;
+        }
+        if let Some(stat) = l.strip_prefix("  ") {
+            let (k, v) = stat.split_once("  ").unwrap_or((stat, ""));
+            let k = format!("    {k}  ");
+            let room = width.saturating_sub(k.chars().count()).max(8);
+            let v: String = v.trim_start().chars().take(room).collect();
+            lines.push(Line::from(vec![
+                Span::styled(k, Style::default().fg(pal.muted)),
+                Span::styled(v, Style::default().fg(pal.text)),
+            ]));
+            continue;
+        }
+        let mut parts = l.splitn(3, " · ");
+        let (name, verdict, summary) = (
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or(""),
+            parts.next().unwrap_or(""),
+        );
+        let (mark, color) = if verdict == "pass" {
+            ("✓", pal.good)
+        } else {
+            ("✗", pal.bad)
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{mark} {name}  "),
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(summary.to_string(), Style::default().fg(pal.text)),
+        ]));
+    }
 }
 
 fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
@@ -1048,10 +1204,12 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             Paragraph::new(Line::from(vec![
                 key(" enter"),
                 label(" ask  "),
+                key("/test"),
+                label(" live tests  "),
                 key("1-5"),
-                label(" apply a suggestion  "),
+                label(" apply  "),
                 key("esc"),
-                label(" back to the dashboard"),
+                label(" back"),
             ])),
             area,
         );
@@ -1167,7 +1325,38 @@ mod tests {
         let chat_text = render(&chat);
         println!("{chat_text}");
         assert!(chat_text.contains("let VM bridges through"));
-        assert!(chat_text.contains("ask the firewall"));
+        assert!(chat_text.contains("ask · qwen2.5"));
+        // the Ask panel carries no instructions or examples
+        for gone in [
+            "Ask anything",
+            "for example",
+            "press the number",
+            "Nothing runs until",
+        ] {
+            assert!(!chat_text.contains(gone), "{gone:?} still shown");
+        }
+
+        // live test results render inside the same panel
+        let report = selftest::run("detector", 1).remove(0).text();
+        app.chat = Some(Chat {
+            history: vec![
+                ("user".into(), "/test detector".into()),
+                ("test".into(), report),
+            ],
+            actions: vec![Action::Test("traffic")],
+            ..Default::default()
+        });
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let tested = render(&term.backend().buffer().clone());
+        println!("{tested}");
+        assert!(tested.contains("✓ detector"));
+        assert!(tested.contains("port scan"));
+        assert!(tested.contains("run the traffic test"));
+        // the empty panel is empty
+        app.chat = Some(Chat::default());
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let empty = render(&term.backend().buffer().clone());
+        assert!(!empty.contains("Ask anything"));
         let buf = &dashboard;
         let text: String = (0..buf.area.height)
             .map(|y| {

@@ -22,14 +22,17 @@ use crate::{
     tui::{StatusView, duration},
 };
 
-/// Small instruct models first: fast enough for a dashboard, good enough to read facts
+/// Small instruct models first: fast enough for a dashboard, good enough to read facts. qwen3.5:4b (3.3 GB at q4) fits a
+/// 6 GB GPU with room for the context; it is a thinking model, so requests turn thinking off (`"think": false`).
 const PREFERRED: &[&str] = &[
+    "qwen3.5:4b",
+    "qwen3.5:4b-q4_K_M",
     "qwen2.5:3b-instruct",
     "qwen2.5:3b",
     "llama3.2:3b",
+    "qwen3:4b",
     "qwen2.5:7b-instruct",
     "qwen2.5:7b",
-    "qwen3:4b",
     "llama3.1:8b",
     "qwen3:8b",
     "llama3.2:1b",
@@ -49,6 +52,8 @@ pub enum Action {
     Open(&'static str, u16),
     Close(&'static str, u16),
     Unban(Src),
+    /// A live test (see selftest.rs): read-only, so it runs without a y / n
+    Test(&'static str),
 }
 
 impl Action {
@@ -58,6 +63,7 @@ impl Action {
             Action::Open(p, port) => format!("open {p} port {port} to everyone"),
             Action::Close(p, port) => format!("close {p} port {port}"),
             Action::Unban(ip) => format!("lift the ban on {ip}"),
+            Action::Test(name) => format!("run the {name} test"),
         }
     }
 
@@ -68,6 +74,7 @@ impl Action {
             Action::Open(p, port) => vec!["open".into(), p.to_string(), port.to_string()],
             Action::Close(p, port) => vec!["close".into(), p.to_string(), port.to_string()],
             Action::Unban(ip) => vec!["unban".into(), ip.to_string()],
+            Action::Test(name) => vec!["test".into(), name.to_string()],
         }
     }
 
@@ -89,6 +96,11 @@ impl Action {
             )),
             ["close", p, port] => Some(Action::Close(proto(p)?, port.parse().ok()?)),
             ["unban", ip] => ip.parse().ok().map(Action::Unban),
+            ["test", "all"] => Some(Action::Test("all")),
+            ["test", name] => crate::selftest::TESTS
+                .iter()
+                .find(|t| t.0 == *name)
+                .map(|t| Action::Test(t.0)),
             _ => None,
         }
     }
@@ -198,7 +210,7 @@ pub fn detect(cfg: &AssistantConfig) -> Result<Backend, String> {
     };
     let host = local_host(&url)?;
     let tags = http(&host, "GET", "/api/tags", None, Duration::from_secs(2)).map_err(|_| {
-        format!("no model server at {url}; install Ollama and `ollama pull qwen2.5:3b-instruct`")
+        format!("no model server at {url}; install Ollama and `ollama pull qwen3.5:4b`")
     })?;
     let installed: Vec<String> = serde_json::from_str::<serde_json::Value>(&tags)
         .ok()
@@ -213,8 +225,11 @@ pub fn detect(cfg: &AssistantConfig) -> Result<Backend, String> {
             .any(|i| i == m || i.strip_suffix(":latest") == Some(m))
     };
 
+    // the security model first (it is what the firewall was tuned with), then LUNA's so only one model sits in memory
     let model = if cfg.model != "auto" {
         cfg.model.clone()
+    } else if let Some(m) = PREFERRED[..2].iter().find(|m| has(m)) {
+        m.to_string()
     } else if let Some(m) = luna.and_then(|l| l.1).filter(|m| has(m)) {
         m
     } else if let Some(m) = PREFERRED.iter().find(|m| has(m)) {
@@ -225,7 +240,7 @@ pub fn detect(cfg: &AssistantConfig) -> Result<Backend, String> {
             .iter()
             .find(|m| !m.contains("vl") && !m.contains("embed") && !m.contains("llava"))
             .cloned()
-            .ok_or("Ollama has no models; run `ollama pull qwen2.5:3b-instruct`")?
+            .ok_or("Ollama has no models; run `ollama pull qwen3.5:4b`")?
     };
     Ok(Backend { host, model, via })
 }
@@ -335,7 +350,10 @@ pub fn context() -> String {
                 ));
             }
         }
-        None => out.push_str("the firewall daemon is not running\n"),
+        None => out.push_str(
+            "the firewall daemon is not running, so ai-firewall blocks NOTHING right now: if traffic is blocked, \
+             the cause is elsewhere (another firewall such as ufw, nothing listening on the port, or the network)\n",
+        ),
     }
 
     if let Some(log) = run_quiet(
@@ -418,9 +436,13 @@ Rules:\n\
   ACTION: open tcp <port>     (or udp) to accept incoming connections on a port\n\
   ACTION: close tcp <port>\n\
   ACTION: unban <address>\n\
+  ACTION: test <name>         (live test, read-only, runs at once; one of: all, {})\n\
 - Propose only actions that the facts support. Never propose opening a port unless the user wants \
 something on this machine to be reachable from outside.\n\
-- Never tell the user to disable the firewall, and never invent other commands to run as root.\n\n\
+- Never tell the user to disable the firewall, and never invent other commands to run as root.\n\
+- When the user asks to test, check or measure the firewall, or when live numbers would settle the question, \
+propose a test instead of guessing. Test results come back to you as a message starting with \"Live test results\"; \
+then explain what they show in two or three sentences and propose actions only if a result failed.\n\n\
 Example answer:\n\
 Your VM is cut off because Docker sets the forward policy to drop, so traffic from virbr0 never leaves the machine. \
 The fix adds an exception for virbr0 only: VMs can go out, and only replies come back in.\n\
@@ -430,6 +452,11 @@ ACTION: fix allow-vm-forwarding\n\n{}",
             .map(|f| f.id)
             .collect::<Vec<_>>()
             .join(", "),
+        crate::selftest::TESTS
+            .iter()
+            .map(|t| format!("{} = {}", t.0, t.1))
+            .collect::<Vec<_>>()
+            .join("; "),
         context()
     )
 }
@@ -448,6 +475,7 @@ pub fn ask(
         "model": backend.model,
         "messages": messages,
         "stream": true,
+        "think": false,
         "options": { "temperature": 0.2 },
     })
     .to_string();
@@ -460,6 +488,7 @@ pub fn ask(
     )
     .map_err(|e| anyhow::anyhow!("{} ({}): {e}", backend.model, backend.host))?;
     let mut full = String::new();
+    let mut think = ThinkFilter::default();
     for line in reader.lines() {
         let line = line?;
         let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -469,14 +498,76 @@ pub fn ask(
             anyhow::bail!("{err}");
         }
         if let Some(piece) = v["message"]["content"].as_str() {
-            full.push_str(piece);
-            on_chunk(piece);
+            let shown = think.push(piece);
+            if !shown.is_empty() {
+                full.push_str(&shown);
+                on_chunk(&shown);
+            }
         }
         if v["done"].as_bool() == Some(true) {
             break;
         }
     }
+    let rest = think.finish();
+    if !rest.is_empty() {
+        full.push_str(&rest);
+        on_chunk(&rest);
+    }
     Ok(full)
+}
+
+/// Drops a leading `<think>...</think>` block from a streamed answer (a thinking model can add one even with
+/// `"think": false`). Text before the answer starts is held back until it is clear whether it is such a block.
+#[derive(Default)]
+struct ThinkFilter {
+    held: String,
+    state: ThinkState,
+}
+
+#[derive(Default, PartialEq)]
+enum ThinkState {
+    #[default]
+    Start,
+    Thinking,
+    Answer,
+}
+
+impl ThinkFilter {
+    /// The part of `piece` to show now.
+    fn push(&mut self, piece: &str) -> String {
+        if self.state == ThinkState::Answer {
+            return piece.to_string();
+        }
+        self.held.push_str(piece);
+        if self.state == ThinkState::Start {
+            let t = self.held.trim_start();
+            if t.is_empty() || (t.len() < 7 && "<think>".starts_with(t)) {
+                return String::new();
+            }
+            if !t.starts_with("<think>") {
+                self.state = ThinkState::Answer;
+                return std::mem::take(&mut self.held).trim_start().to_string();
+            }
+            self.state = ThinkState::Thinking;
+        }
+        match self.held.split_once("</think>") {
+            Some((_, after)) => {
+                let after = after.trim_start().to_string();
+                self.held.clear();
+                self.state = ThinkState::Answer;
+                after
+            }
+            None => String::new(),
+        }
+    }
+
+    /// At the end: text still held back (an unclosed block or a tag fragment) is better shown than lost.
+    fn finish(&mut self) -> String {
+        if self.state == ThinkState::Answer {
+            return String::new();
+        }
+        std::mem::take(&mut self.held).trim().to_string()
+    }
 }
 
 /// What to show when no model is available: the doctor's findings, as actions
@@ -510,6 +601,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn think_blocks_are_dropped_from_streams() {
+        let run = |pieces: &[&str]| {
+            let mut f = ThinkFilter::default();
+            let mut out: String = pieces.iter().map(|p| f.push(p)).collect();
+            out.push_str(&f.finish());
+            out
+        };
+        assert_eq!(run(&["Port 22 ", "is open."]), "Port 22 is open.");
+        assert_eq!(
+            run(&["<thi", "nk>hmm", "</think>\n\nAll ", "good."]),
+            "All good."
+        );
+        assert_eq!(run(&["  <think>x</think>Done"]), "Done");
+        assert_eq!(run(&["<think>never closed"]), "<think>never closed");
+        assert_eq!(run(&["<"]), "<");
+    }
+
+    #[test]
     fn only_allowlisted_actions_parse() {
         let reply = "Docker drops forwarded traffic.\n\
             ACTION: fix allow-vm-forwarding\n\
@@ -518,13 +627,16 @@ mod tests {
             ACTION: run sudo iptables -F\n\
             ACTION: open tcp 0\n\
             ACTION: unban 10.67.2.249\n\
-            ACTION: fix allow-vm-forwarding\n";
+            ACTION: fix allow-vm-forwarding\n\
+            ACTION: test detector\n\
+            ACTION: test flood-the-router\n";
         assert_eq!(
             parse_actions(reply),
             vec![
                 Action::Fix("allow-vm-forwarding"),
                 Action::Open("tcp", 22),
                 Action::Unban("10.67.2.249".parse().unwrap()),
+                Action::Test("detector"),
             ]
         );
         assert_eq!(strip_actions(reply), "Docker drops forwarded traffic.");

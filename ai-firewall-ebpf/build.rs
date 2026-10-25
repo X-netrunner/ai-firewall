@@ -12,6 +12,10 @@ use which::which;
 ///
 /// [bindeps]: https://doc.rust-lang.org/nightly/cargo/reference/unstable.html?highlight=feature#artifact-dependencies
 fn main() {
+    println!("cargo:rerun-if-env-changed=AYA_BUILD_SKIP");
+    if std::env::var("AYA_BUILD_SKIP").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
+        return; // userspace-only build, see ai-firewall/build.rs
+    }
     let bpf_linker = which("bpf-linker").unwrap();
     println!("cargo:rerun-if-changed={}", bpf_linker.to_str().unwrap());
 }

@@ -13,6 +13,8 @@ mod feeds;
 mod history;
 mod links;
 mod net;
+mod posture;
+mod selftest;
 mod state;
 mod tui;
 
@@ -83,7 +85,12 @@ enum Cmd {
         refresh: bool,
     },
     /// Ask the firewall's assistant why something doesn't work
-    Ask { question: Vec<String> },
+    Ask {
+        question: Vec<String>,
+        /// One JSON event per line (model, chunk, tests, done), for the Halcyon Security center
+        #[arg(long)]
+        json: bool,
+    },
     /// Stop filtering completely (stops the service and removes the pinned filter)
     Off,
     /// Find out why the network (or a VM) isn't working
@@ -100,6 +107,29 @@ enum Cmd {
     },
     /// Apply one fix by id (see `ai-firewall doctor`)
     Fix { id: String },
+    /// Live tests: health, ports, detector, traffic, services, or all (local only, nothing is sent to other hosts)
+    Test {
+        /// Which test; all of them when left out
+        #[arg(default_value = "all")]
+        name: String,
+        /// How long `traffic` samples, in seconds (at most 30)
+        #[arg(long, default_value_t = selftest::DEFAULT_TRAFFIC_SECS)]
+        secs: u64,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show or set the system posture laid over the config: secure, relaxed, lockdown, stealth
+    /// (Halcyon's sysmode sets it per mode; your config file is not changed)
+    Posture {
+        name: Option<String>,
+        /// stealth: a local network that may reach the honeypot ports (repeat for more)
+        #[arg(long)]
+        lan: Vec<String>,
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
     /// Check the config file without applying it
     Check,
     /// Print the default config
@@ -111,6 +141,11 @@ async fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
+    // Commands print and exit: `ai-firewall status | head` should end quietly, not panic on the closed pipe.
+    // The daemon keeps ignoring SIGPIPE (a closed socket must not kill it).
+    if !matches!(opt.cmd, None | Some(Cmd::Run)) {
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     match opt.cmd.unwrap_or(Cmd::Run) {
         Cmd::Run => {
             need_root()?;
@@ -138,6 +173,32 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Cmd::Doctor { fix, yes, json } => doctor(fix, yes, json),
+        Cmd::Posture { name, lan, json } => posture_cmd(name, lan, json),
+        Cmd::Test { name, secs, json } => {
+            if !selftest::is_test(&name) {
+                bail!(
+                    "unknown test {name:?}; known: all, {}",
+                    selftest::TESTS
+                        .iter()
+                        .map(|t| t.0)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            let reports = selftest::run(&name, secs);
+            if json {
+                println!("{}", serde_json::to_string_pretty(&reports)?);
+            } else {
+                for r in &reports {
+                    println!("{}", r.text());
+                }
+            }
+            if reports.iter().all(|r| r.ok) {
+                Ok(())
+            } else {
+                std::process::exit(1)
+            }
+        }
         Cmd::Fix { id } => {
             println!("{}", doctor::apply(&id)?);
             Ok(())
@@ -160,7 +221,8 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Ask { question } => ask(question.join(" ")),
+        Cmd::Ask { question, json } if json => ask_json(question.join(" ")),
+        Cmd::Ask { question, .. } => ask(question.join(" ")),
         Cmd::History { n, json } => {
             let entries = history::read(n);
             if json {
@@ -252,6 +314,46 @@ fn need_root() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn posture_cmd(name: Option<String>, lan: Vec<String>, json: bool) -> anyhow::Result<()> {
+    let path = std::path::Path::new(posture::PATH);
+    if let Some(name) = name {
+        let p = posture::Posture::new(&name, lan)?;
+        need_root()?;
+        if name == "secure" && p.lan.is_empty() {
+            // secure = the config as written: no file at all
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        } else {
+            p.save(path)?;
+        }
+        history::record("posture", "", name.clone());
+    }
+    let (current, err) = posture::Posture::load(path);
+    let name = current.as_ref().map_or("secure", |p| p.name.as_str());
+    if json {
+        let v = serde_json::json!({
+            "posture": name,
+            "lan": current.as_ref().map(|p| p.lan.clone()).unwrap_or_default(),
+            "error": err,
+            "known": posture::POSTURES.iter().map(|(n, what)| serde_json::json!({"name": n, "what": what})).collect::<Vec<_>>(),
+        });
+        println!("{v}");
+        return Ok(());
+    }
+    if let Some(e) = err {
+        println!("posture file ignored: {e}");
+    }
+    for (n, what) in posture::POSTURES {
+        println!("{} {n:9} {what}", if *n == name { "*" } else { " " });
+    }
+    if let Some(p) = current.filter(|p| !p.lan.is_empty()) {
+        println!("  lan: {}", p.lan.join(" "));
+    }
+    Ok(())
+}
+
 fn status() -> anyhow::Result<()> {
     let text = match std::fs::read_to_string(state::STATUS_FILE) {
         Ok(t) => t,
@@ -259,8 +361,7 @@ fn status() -> anyhow::Result<()> {
     };
     let s: Value = serde_json::from_str(&text)?;
     let n = |k: &str| s[k].as_u64().unwrap_or(0);
-    let age = net::unix_secs().saturating_sub(n("updated_unix"));
-    let alive = std::path::Path::new(&format!("/proc/{}", n("pid"))).exists() && age < 30;
+    let alive = tui::daemon_alive(n("pid") as u32, n("updated_unix"), net::unix_secs());
     let list = |k: &str| {
         let v: Vec<String> = s[k]
             .as_array()
@@ -291,6 +392,12 @@ fn status() -> anyhow::Result<()> {
         duration(n("updated_unix").saturating_sub(n("started_unix")).max(1)),
         n("attaches"),
     );
+    if let Some(p) = s["posture"].as_str() {
+        println!("  posture    {p} (ai-firewall posture)");
+    }
+    if let Some(err) = s["posture_error"].as_str() {
+        println!("  posture    ignored: {err}");
+    }
     if let Some(err) = s["config_error"].as_str() {
         println!(
             "  CONFIG     has an error, the last config that worked is in force:\n             {err}"
@@ -520,6 +627,114 @@ fn ask(question: String) -> anyhow::Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+/// `ask --json`: the same answer as events, one JSON object per line. Tests the model asks for are run
+/// at once (they are read-only, see selftest.rs) and the model explains them; one round per question.
+fn ask_json(question: String) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    let emit = |v: serde_json::Value| {
+        let mut out = std::io::stdout().lock();
+        let _ = writeln!(out, "{v}");
+        let _ = out.flush();
+    };
+    let actions_json = |actions: &[assistant::Action]| {
+        actions
+            .iter()
+            .map(|a| serde_json::json!({ "args": a.args(), "describe": a.describe(), "test": matches!(a, assistant::Action::Test(_)) }))
+            .collect::<Vec<_>>()
+    };
+    if question.trim().is_empty() {
+        emit(serde_json::json!({ "type": "error", "error": "empty question" }));
+        return Ok(());
+    }
+    // a typed "/test [name]" runs tests without asking the model first
+    let typed = question
+        .trim()
+        .strip_prefix("/test")
+        .map(|r| match r.trim() {
+            "" => "all".to_string(),
+            n => n.to_string(),
+        });
+    let backend = assistant::detect(&assistant::load_config());
+    if let Ok(b) = &backend {
+        emit(serde_json::json!({ "type": "model", "name": format!("{} via {}", b.model, b.via) }));
+    }
+    let mut history: Vec<(String, String)> = Vec::new();
+    let run_tests = |name: &str, history: &mut Vec<(String, String)>| {
+        let reports = selftest::run(name, selftest::DEFAULT_TRAFFIC_SECS);
+        let text = reports
+            .iter()
+            .map(|r| r.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        emit(serde_json::json!({ "type": "tests", "reports": reports }));
+        history.push(("user".into(), format!("Live test results:\n{text}")));
+    };
+    let reply = |history: &[(String, String)]| -> anyhow::Result<String> {
+        let Ok(b) = &backend else {
+            return Ok(String::new());
+        };
+        assistant::ask(b, history, |piece| {
+            emit(serde_json::json!({ "type": "chunk", "text": piece }))
+        })
+    };
+    if let Some(name) = typed {
+        if !selftest::is_test(&name) {
+            emit(serde_json::json!({ "type": "error", "error": format!("unknown test {name:?}") }));
+            return Ok(());
+        }
+        run_tests(&name, &mut history);
+        if backend.is_err() {
+            emit(serde_json::json!({ "type": "done", "text": "", "actions": [] }));
+            return Ok(());
+        }
+    } else {
+        history.push(("user".into(), question));
+    }
+    let Ok(_) = &backend else {
+        let (text, actions) = assistant::offline_answer();
+        emit(
+            serde_json::json!({ "type": "done", "text": text, "actions": actions_json(&actions), "offline": true }),
+        );
+        return Ok(());
+    };
+    let mut full = match reply(&history) {
+        Ok(r) => r,
+        Err(e) => {
+            emit(serde_json::json!({ "type": "error", "error": format!("{e:#}") }));
+            return Ok(());
+        }
+    };
+    let mut actions = assistant::parse_actions(&full);
+    let wanted: Vec<&'static str> = actions
+        .iter()
+        .filter_map(|a| match a {
+            assistant::Action::Test(n) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    if !wanted.is_empty() && !history.iter().any(|h| h.1.starts_with("Live test results")) {
+        history.push(("assistant".into(), full.clone()));
+        let name = if wanted.len() > 1 { "all" } else { wanted[0] };
+        emit(serde_json::json!({ "type": "chunk", "text": "\n" }));
+        run_tests(name, &mut history);
+        full = match reply(&history) {
+            Ok(r) => r,
+            Err(e) => {
+                emit(serde_json::json!({ "type": "error", "error": format!("{e:#}") }));
+                return Ok(());
+            }
+        };
+        actions = assistant::parse_actions(&full)
+            .into_iter()
+            .filter(|a| !matches!(a, assistant::Action::Test(_)))
+            .collect();
+    }
+    emit(
+        serde_json::json!({ "type": "done", "text": assistant::strip_actions(&full), "actions": actions_json(&actions) }),
+    );
     Ok(())
 }
 

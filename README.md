@@ -83,6 +83,28 @@ actions from a fixed list (doctor fixes, `open`/`close` a port, `unban`), and no
 runs until you confirm. With no model installed you get the doctor's findings instead.
 Run it with sudo so it can also see firewall rules and bans.
 
+## Live tests
+
+`ai-firewall test [health|ports|detector|traffic|services|all] [--json]`, `/test` in the `top` Ask panel, or
+the model asks for one itself (`ACTION: test <name>`; tests are read-only, so they run without a y / n and the
+model explains the results in the same panel):
+
+- **health**: daemon alive, status fresh, filter attached, events lost, active bans
+- **ports**: open ports with nothing listening behind them, and services listening on ports that are closed
+- **detector**: simulated port scan, connection flood, UDP flood, stealth scan, normal use and a trusted source,
+  replayed through an in-memory copy of the detector with your thresholds: what gets banned, after how many
+  packets, and the cost per packet
+- **traffic**: packets passed and dropped per second, new bans, events lost, sampled from the status file
+- **services**: whether the services on your open TCP ports answer on 127.0.0.1
+
+Safety limits are in the code (`selftest.rs`), not in the prompt: nothing is sent to another host; the only live
+connections go to 127.0.0.1, to at most 16 ports the config opens, one attempt each with a 300 ms timeout;
+simulated packets use documentation addresses (RFC 5737) and never touch the running daemon; `traffic` samples
+for at most 30 s. No test needs root or changes anything.
+
+`ai-firewall ask --json "..."` prints the answer as JSON lines (`model`, `chunk`, `tests`, `done`, `error`) for
+the Halcyon Security center.
+
 ## Install (replaces ufw)
 
 ```shell
@@ -119,6 +141,13 @@ which resets connections it doesn't know about.
 
 ```shell
 cargo test --release -p ai-firewall --no-run && $(ls -t target/release/build/ai-firewall/*/out/ai_firewall-* | head -1)
+```
+
+Without nightly / bpf-linker, `AYA_BUILD_SKIP=1` builds only the userspace side (the embedded eBPF object is an
+empty placeholder, so the daemon cannot start, but every other command and all unit tests work):
+
+```shell
+AYA_BUILD_SKIP=1 cargo test --release -p ai-firewall --no-run && $(ls -t target/release/deps/ai_firewall-* | grep -v '\.d$' | head -1)
 ```
 
 ## Prerequisites

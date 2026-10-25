@@ -2,6 +2,17 @@ use anyhow::{Context as _, anyhow};
 use aya_build::Toolchain;
 
 fn main() -> anyhow::Result<()> {
+    // AYA_BUILD_SKIP=1 (no nightly / bpf-linker): build the userspace side for checks and unit tests only.
+    // The embedded object is empty, so the daemon refuses to start; every other command works.
+    println!("cargo:rerun-if-env-changed=AYA_BUILD_SKIP");
+    if std::env::var("AYA_BUILD_SKIP").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
+        let out = std::env::var("OUT_DIR").context("OUT_DIR")?;
+        std::fs::write(std::path::Path::new(&out).join("ai-firewall"), [])?;
+        println!(
+            "cargo:warning=AYA_BUILD_SKIP set: eBPF object is a placeholder, the daemon will not run"
+        );
+        return Ok(());
+    }
     let cargo_metadata::Metadata { packages, .. } = cargo_metadata::MetadataCommand::new()
         .no_deps()
         .exec()

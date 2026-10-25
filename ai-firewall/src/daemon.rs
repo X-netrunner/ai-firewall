@@ -130,6 +130,9 @@ pub struct Status {
     pub feed_networks: usize,
     /// the config file has an error; the last config that worked is in force
     pub config_error: Option<String>,
+    /// the system posture (Halcyon sysmode: secure, relaxed, lockdown, stealth); none = the config as written
+    pub posture: Option<String>,
+    pub posture_error: Option<String>,
     pub bans: Vec<StatusBan>,
     pub recent: Vec<RecentBan>,
 }
@@ -144,7 +147,11 @@ pub struct StatusBan {
 }
 
 pub async fn run(config_path: PathBuf, iface_override: Option<String>) -> anyhow::Result<()> {
-    let (mut cfg, cfg_error) = Config::load_at_start(&config_path);
+    let (cfg, cfg_error) = Config::load_at_start(&config_path);
+    let posture_path = Path::new(crate::posture::PATH);
+    let (posture, mut posture_error) = crate::posture::Posture::load(posture_path);
+    let mut cfg = with_posture(cfg, posture.as_ref());
+    let mut posture_mtime = mtime(posture_path);
     // what is wrong with the config file right now (shown in status, the doctor and the Center)
     let mut config_error: Option<String> = cfg_error.as_ref().map(|e| format!("{e:#}"));
     match &cfg_error {
@@ -269,9 +276,19 @@ pub async fn run(config_path: PathBuf, iface_override: Option<String>) -> anyhow
         tick += 1;
 
         let now_mtime = mtime(&config_path);
-        if reload || now_mtime != cfg_mtime {
+        let now_posture = mtime(posture_path);
+        if reload || now_mtime != cfg_mtime || now_posture != posture_mtime {
             cfg_mtime = now_mtime;
-            match Config::load_or_create(&config_path) {
+            posture_mtime = now_posture;
+            let (posture, err) = crate::posture::Posture::load(posture_path);
+            if err.is_some() && err != posture_error {
+                error!(
+                    "[!] posture ignored: {}",
+                    err.as_deref().unwrap_or_default()
+                );
+            }
+            posture_error = err;
+            match Config::load_or_create(&config_path).map(|c| with_posture(c, posture.as_ref())) {
                 Ok(mut new_cfg) => {
                     if let Some(iface) = &iface_override {
                         new_cfg.interface = iface.clone();
@@ -397,6 +414,7 @@ pub async fn run(config_path: PathBuf, iface_override: Option<String>) -> anyhow
                 attaches,
             );
             status.config_error = config_error.clone();
+            status.posture_error = posture_error.clone();
             if let Err(e) = serde_json::to_vec_pretty(&status)
                 .map_err(anyhow::Error::from)
                 .and_then(|j| state::write_atomic(Path::new(state::STATUS_FILE), &j))
@@ -412,6 +430,17 @@ pub async fn run(config_path: PathBuf, iface_override: Option<String>) -> anyhow
     save(&mut lock(&shared));
     let _ = std::fs::remove_file(state::STATUS_FILE);
     Ok(())
+}
+
+/// The config with the posture laid over it, logged when one applies
+fn with_posture(cfg: Config, posture: Option<&crate::posture::Posture>) -> Config {
+    match posture {
+        Some(p) => {
+            info!("[*] posture: {}", p.name);
+            p.apply(cfg)
+        }
+        None => cfg,
+    }
 }
 
 fn lock(shared: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
@@ -1028,6 +1057,8 @@ fn build_status(
         feeds: feed_states.to_vec(),
         feed_networks,
         config_error: None,
+        posture: cfg.posture.clone(),
+        posture_error: None,
         bans,
         recent: s.recent.iter().cloned().collect(),
     }

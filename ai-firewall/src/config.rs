@@ -95,7 +95,7 @@ drop_limit = 30
 # Ask the firewall what's wrong (in `ai-firewall top`, press a). Uses a local model only:
 # LUNA's model if LUNA is set up, else Ollama. Without one you still get the doctor.
 enabled = true
-# "auto" picks a small installed model (qwen2.5:3b-instruct, llama3.2:3b, ...)
+# "auto": qwen3.5:4b when installed (ollama pull qwen3.5:4b), else LUNA's model, else a small installed one
 model = "auto"
 # url = "http://localhost:11434"
 
@@ -142,6 +142,9 @@ pub struct Config {
     pub profiles: std::collections::BTreeMap<String, Profile>,
     #[serde(default)]
     pub notify: NotifyConfig,
+    /// The posture laid over this config (posture.rs), not part of the file
+    #[serde(skip)]
+    pub posture: Option<String>,
 }
 
 /// A port or a range: 22 or "1714-1764"
