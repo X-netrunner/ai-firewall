@@ -4,6 +4,23 @@ A lightweight, self-healing firewall for a Linux desktop, built on eBPF/XDP. It 
 to replace ufw: inbound traffic is denied by default, outbound is always allowed, and
 sources that scan or flood you get banned by themselves.
 
+## Part of Halcyon
+
+ai-firewall is one of three companion projects of [Halcyon](https://github.com/X-netrunner/Halcyon), a Hyprland desktop, together with
+[ai-antivirus](https://github.com/X-netrunner/ai-antivirus) and the local assistant [Luna](https://github.com/X-netrunner/LUNA-AI). **It works fine on its own**
+(everything below is plain command line and a systemd service), and it fits best with the other two:
+
+- **In Halcyon's Security center** the firewall has its own page: what passed and what was dropped, live traffic, bans and detections, plus **Test** (its live checks), **Doctor** (`ai-firewall doctor --fix`) and
+  **Dashboard** (the live `top` view). The last two ask for your admin password. The overview shows it next to the antivirus, and the Security center's *Ask* tab sends firewall questions to `ai-firewall ask`.
+- **Halcyon's sysmode** (the hardening profiles) sets the system posture through `ai-firewall posture`; your config file is not changed.
+- **Luna** can read the firewall ("is my firewall running?" runs `ai-firewall status`) and, only when you have allowed it (her developer-signed capability gate, and admin rights), ban or unban an address and open or close a port.
+  Nothing in the firewall can be changed by the model on its own.
+- Halcyon's installer sets it up: `./install.sh --firewall ai` builds it and replaces ufw (`--firewall ufw` or `none` keep or leave the old one).
+
+![The firewall page in Halcyon's Security center](docs/halcyon-firewall.webp)
+
+![The Security center overview: firewall and antivirus side by side](docs/halcyon-security.webp)
+
 ## How it works
 
 - **In the kernel (XDP)**, every inbound packet is checked before the network stack sees it:
