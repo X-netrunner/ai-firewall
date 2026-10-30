@@ -16,7 +16,6 @@ name = "ai-firewall"
 version = "0.2.1"
 dependencies = [
  "ai-firewall-common",
- "ai-firewall-ebpf",
  "anyhow",
  "aya",
  "aya-build",

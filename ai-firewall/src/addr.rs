@@ -63,9 +63,17 @@ impl Serialize for Src {
 
 impl<'de> Deserialize<'de> for Src {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        String::deserialize(d)?
-            .parse()
-            .map_err(serde::de::Error::custom)
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Src;
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("an IPv4 address or an IPv6 prefix")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                v.parse().map_err(serde::de::Error::custom)
+            }
+        }
+        d.deserialize_str(Visitor)
     }
 }
 

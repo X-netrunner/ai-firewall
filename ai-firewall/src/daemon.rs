@@ -903,7 +903,7 @@ fn sweep(s: &mut Shared) {
 fn spawn_event_reader(events: RingBuf<MapData>, shared: Arc<Mutex<Shared>>) -> anyhow::Result<()> {
     let mut async_fd = tokio::io::unix::AsyncFd::new(events)?;
     tokio::task::spawn(async move {
-        let mut batch: Vec<PacketEvent> = Vec::new();
+        let mut batch: Vec<PacketEvent> = Vec::with_capacity(128);
         loop {
             let mut guard = match async_fd.readable_mut().await {
                 Ok(g) => g,
@@ -916,6 +916,8 @@ fn spawn_event_reader(events: RingBuf<MapData>, shared: Arc<Mutex<Shared>>) -> a
             let ring_buf = guard.get_inner_mut();
             while let Some(item) = ring_buf.next() {
                 if item.len() >= std::mem::size_of::<PacketEvent>() {
+                    // SAFETY: item contains at least size_of::<PacketEvent>() bytes emitted by the eBPF ringbuf.
+                    // read_unaligned safely handles any potential alignment mismatch.
                     batch.push(unsafe {
                         std::ptr::read_unaligned(item.as_ptr() as *const PacketEvent)
                     });
