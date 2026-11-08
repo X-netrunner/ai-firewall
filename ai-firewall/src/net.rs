@@ -39,7 +39,7 @@ fn parse_default_route(text: &str) -> Option<(String, u32)> {
         .skip(1)
         .filter_map(|line| {
             let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() < 7 || f[1] != "00000000" || f[7] != "00000000" {
+            if f.len() < 8 || f[1] != "00000000" || f[7] != "00000000" {
                 return None;
             }
             // /proc/net/route prints the raw network-order u32 in native-endian hex
@@ -226,6 +226,11 @@ mod tests {
         let (iface, gw) = parse_default_route(text).unwrap();
         assert_eq!(iface, "enp2s0");
         assert_eq!(Ipv4Addr::from(gw), Ipv4Addr::new(192, 168, 1, 1));
+    }
+
+    #[test]
+    fn truncated_route_does_not_panic() {
+        assert_eq!(parse_default_route("header\neth0 00000000 0100007F 0003 0 0 100\n"), None);
     }
 
     #[test]
