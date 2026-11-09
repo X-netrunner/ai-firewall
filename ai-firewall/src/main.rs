@@ -4,6 +4,7 @@
 //---------------------------
 
 mod addr;
+mod antivirus;
 mod assistant;
 mod config;
 mod daemon;
@@ -49,7 +50,17 @@ enum Cmd {
     /// Run the firewall (the default)
     Run,
     /// Show what the running firewall is doing
-    Status,
+    Status {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
+    /// AI Antivirus cooperative defense status and synced threats
+    Antivirus {
+        /// Machine-readable output
+        #[arg(long)]
+        json: bool,
+    },
     /// Live dashboard (run with sudo to ban / unban from it)
     Top {
         /// Open straight into the "ask the firewall" panel
@@ -151,7 +162,8 @@ async fn main() -> anyhow::Result<()> {
             need_root()?;
             daemon::run(opt.config, opt.iface).await
         }
-        Cmd::Status => status(),
+        Cmd::Status { json } => status(json),
+        Cmd::Antivirus { json } => antivirus_cmd(json),
         Cmd::Top { ask } => tui::run(ask),
         Cmd::Ban { ip, minutes } => {
             need_root()?;
@@ -354,11 +366,16 @@ fn posture_cmd(name: Option<String>, lan: Vec<String>, json: bool) -> anyhow::Re
     Ok(())
 }
 
-fn status() -> anyhow::Result<()> {
+fn status(json: bool) -> anyhow::Result<()> {
     let text = match std::fs::read_to_string(state::STATUS_FILE) {
         Ok(t) => t,
         Err(_) => bail!("ai-firewall is not running (no {})", state::STATUS_FILE),
     };
+    if json {
+        let val: Value = serde_json::from_str(&text)?;
+        println!("{}", serde_json::to_string_pretty(&val)?);
+        return Ok(());
+    }
     let s: Value = serde_json::from_str(&text)?;
     let n = |k: &str| s[k].as_u64().unwrap_or(0);
     let alive = tui::daemon_alive(n("pid") as u32, n("updated_unix"), net::unix_secs());
@@ -392,6 +409,22 @@ fn status() -> anyhow::Result<()> {
         duration(n("updated_unix").saturating_sub(n("started_unix")).max(1)),
         n("attaches"),
     );
+    if let Some(av) = s.get("antivirus") {
+        if av["installed"].as_bool() == Some(true) {
+            let active = av["active"].as_bool() == Some(true);
+            let synced = av["synced_threats"].as_u64().unwrap_or(0);
+            println!(
+                "  antivirus  {} ({synced} threat blocks synced to XDP)",
+                if active { "co-defense active" } else { "companion inactive" }
+            );
+        }
+    }
+    if let Some(vpns) = s.get("vpn_interfaces").and_then(|v| v.as_array()) {
+        if !vpns.is_empty() {
+            let names: Vec<&str> = vpns.iter().filter_map(|v| v.as_str()).collect();
+            println!("  vpn        {} (traffic and endpoints protected)", names.join(", "));
+        }
+    }
     if let Some(p) = s["posture"].as_str() {
         println!("  posture    {p} (ai-firewall posture)");
     }
@@ -486,6 +519,42 @@ fn status() -> anyhow::Result<()> {
                 r["strikes"].as_u64().unwrap_or(0)
             );
         }
+    }
+    Ok(())
+}
+
+fn antivirus_cmd(json: bool) -> anyhow::Result<()> {
+    let threats = antivirus::fetch_threats();
+    let status = antivirus::detect_status(threats.len(), net::unix_secs());
+    if json {
+        let threat_list: Vec<Value> = threats.iter().map(|t| {
+            serde_json::json!({
+                "ip": t.ip.to_string(),
+                "ttl_secs": t.ttl_secs,
+                "reason": t.reason,
+            })
+        }).collect();
+        let payload = serde_json::json!({
+            "status": status,
+            "threats": threat_list,
+        });
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+        return Ok(());
+    }
+    println!("AI Antivirus Co-defense Mesh");
+    println!("  installed  {}", if status.installed { "yes" } else { "no" });
+    println!("  status     {}", status.details);
+    println!("  services   sensord={}, engined={}, responderd={}",
+        if status.sensord_active { "active" } else { "inactive" },
+        if status.engined_active { "active" } else { "inactive" },
+        if status.responderd_active { "active" } else { "inactive" },
+    );
+    println!("\nsynced threat blocks ({})", threats.len());
+    for t in &threats {
+        println!("  {:24}  {:>8}s  {}", t.ip, t.ttl_secs, t.reason);
+    }
+    if threats.is_empty() {
+        println!("  no active threat blocks from ai-antivirus");
     }
     Ok(())
 }

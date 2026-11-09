@@ -20,6 +20,60 @@ const MAX_TRACKED: usize = 16384;
 /// Odd-flag (null / xmas / FIN) packets needed for a full score on their own
 const ODD_LIMIT: f32 = 3.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttackType {
+    PortScan,
+    ConnectionFlood,
+    UdpFlood,
+    ProbingClosedPorts,
+    StealthScan,
+    DistributedScan,
+    AntivirusThreat,
+    Anomaly,
+}
+
+impl AttackType {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::PortScan => "port scan",
+            Self::ConnectionFlood => "connection flood",
+            Self::UdpFlood => "udp flood",
+            Self::ProbingClosedPorts => "probing closed ports",
+            Self::StealthScan => "stealth scan",
+            Self::DistributedScan => "distributed scan",
+            Self::AntivirusThreat => "antivirus threat",
+            Self::Anomaly => "anomaly",
+        }
+    }
+}
+
+/// Identifies well-known local area network discovery and service announcement ports
+#[inline]
+pub fn is_lan_discovery_port(port: u16) -> bool {
+    matches!(port, 5353 | 1900 | 5355 | 3702 | 137 | 138 | 67 | 68)
+}
+
+/// Checks if an IPv4 address is in RFC 1918 private / link-local address space
+#[inline]
+pub fn is_private_v4(ip: u32) -> bool {
+    let b0 = (ip >> 24) as u8;
+    let b1 = (ip >> 16) as u8;
+    b0 == 10
+        || (b0 == 172 && (16..=31).contains(&b1))
+        || (b0 == 192 && b1 == 168)
+        || (b0 == 169 && b1 == 254)
+}
+
+/// Checks if a source belongs to local / private network address spaces
+#[inline]
+pub fn is_lan_src(src: Src) -> bool {
+    match src {
+        Src::V4(ip) => is_private_v4(ip),
+        Src::V6(p) => p >> 54 == 0x3fa, // fe80::/10 link-local
+    }
+}
+
 #[derive(Debug, Default)]
 struct Track {
     window_start: u64,
@@ -45,6 +99,7 @@ pub struct Ban {
     pub strikes: u32,
     pub score: f32,
     pub reason: &'static str,
+    pub attack_type: AttackType,
     /// e.g. "tcp 22 23 80 +9", so a ban can be checked at a glance
     pub ports: String,
 }
@@ -139,10 +194,11 @@ impl Detector {
         } else if ev.is_syn() {
             track.syn += 1;
         }
-        if ev.verdict == VERDICT_DROP_POLICY {
+        let is_discovery = is_lan_src(ip) && is_lan_discovery_port(ev.dst_port);
+        if ev.verdict == VERDICT_DROP_POLICY && !is_discovery {
             track.drops += 1;
         }
-        if track.ports.len() <= cfg.port_limit as usize && !track.ports.contains(&ev.dst_port) {
+        if !is_discovery && track.ports.len() <= cfg.port_limit as usize && !track.ports.contains(&ev.dst_port) {
             track.ports.push(ev.dst_port);
         }
 
@@ -164,11 +220,18 @@ impl Detector {
         if score < 1.0 {
             return None;
         }
-        let reason = signals
+        let (reason, attack_type) = match signals
             .iter()
-            .max_by(|a, b| a.0.total_cmp(&b.0))
-            .map(|s| s.1)
-            .unwrap_or("anomaly");
+            .enumerate()
+            .max_by(|(_, a), (_, b)| a.0.total_cmp(&b.0))
+        {
+            Some((0, s)) => (s.1, AttackType::ConnectionFlood),
+            Some((1, s)) => (s.1, AttackType::PortScan),
+            Some((2, s)) => (s.1, AttackType::UdpFlood),
+            Some((3, s)) => (s.1, AttackType::ProbingClosedPorts),
+            Some((4, s)) => (s.1, AttackType::StealthScan),
+            _ => ("anomaly", AttackType::Anomaly),
+        };
         let track = self.tracks.remove(&ip).unwrap_or_default();
         let proto = match (track.tcp_seen, track.udp_seen) {
             (true, true) => "tcp/udp",
@@ -180,7 +243,7 @@ impl Detector {
             ports.push(format!("+{}", track.ports.len() - 4));
         }
         let ports = format!("{proto} {}", ports.join(" "));
-        Some(self.escalate(ip, score, reason, ports, now))
+        Some(self.escalate(ip, score, reason, attack_type, ports, now))
     }
 
     /// Repeat offenders get exponentially longer bans: base, 2x, 4x ... up to max
@@ -189,6 +252,7 @@ impl Detector {
         ip: Src,
         score: f32,
         reason: &'static str,
+        attack_type: AttackType,
         ports: String,
         now: u64,
     ) -> Ban {
@@ -214,7 +278,25 @@ impl Detector {
             strikes: offender.strikes,
             score,
             reason,
+            attack_type,
             ports,
+        }
+    }
+
+    /// Prunes or evicts tracked sources to relieve pressure under heavy scan/floods
+    pub fn emergency_evict(&mut self, now: u64, target_len: usize) {
+        self.prune(now);
+        if self.tracks.len() > target_len {
+            let mut items: Vec<(Src, u32)> = self
+                .tracks
+                .iter()
+                .map(|(k, v)| (*k, v.drops + v.syn + v.odd))
+                .collect();
+            items.sort_by_key(|i| i.1);
+            let to_remove = self.tracks.len().saturating_sub(target_len);
+            for (ip, _) in items.into_iter().take(to_remove) {
+                self.tracks.remove(&ip);
+            }
         }
     }
 
@@ -377,5 +459,30 @@ mod tests {
         }
         d.prune(1000);
         assert_eq!(d.tracked(), 0);
+    }
+
+    #[test]
+    fn lan_discovery_traffic_not_banned() {
+        let mut d = det();
+        let lan_ip = u32::from(std::net::Ipv4Addr::new(192, 168, 1, 50));
+        let make_discovery = |port| PacketEvent {
+            src6: 0,
+            src_ip: lan_ip,
+            dst_port: port,
+            src_port: 50000,
+            protocol: PROTO_UDP,
+            tcp_flags: 0,
+            payload_len: 100,
+            verdict: VERDICT_DROP_POLICY,
+            family: ai_firewall_common::FAMILY_V4,
+            _pad: [0; 2],
+        };
+
+        // Even with multiple mDNS and SSDP discovery queries dropped by policy,
+        // it shouldn't ban the friendly LAN device as a port scanner
+        for _ in 0..20 {
+            assert!(d.observe(&make_discovery(5353), 0).is_none());
+            assert!(d.observe(&make_discovery(1900), 0).is_none());
+        }
     }
 }

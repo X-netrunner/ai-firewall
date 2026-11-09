@@ -10,8 +10,9 @@ ai-firewall is one of three companion projects of [Halcyon](https://github.com/X
 [ai-antivirus](https://github.com/X-netrunner/ai-antivirus) and the local assistant [Luna](https://github.com/X-netrunner/LUNA-AI). **It works fine on its own**
 (everything below is plain command line and a systemd service), and it fits best with the other two:
 
-- **In Halcyon's Security center** the firewall has its own page: what passed and what was dropped, live traffic, bans and detections, plus **Test** (its live checks), **Doctor** (`ai-firewall doctor --fix`) and
+- **In Halcyon's Security center** the firewall has its own page: what passed and what was dropped, live traffic, bans and detections, plus **Test** (its live checks, including `antivirus` co-defense), **Doctor** (`ai-firewall doctor --fix`) and
   **Dashboard** (the live `top` view). The last two ask for your admin password. The overview shows it next to the antivirus, and the Security center's *Ask* tab sends firewall questions to `ai-firewall ask`.
+- **Cooperative defense with ai-antivirus**: when `ai-antivirus` detects malicious outbound C2 or suspicious socket connections, `ai-firewall` synchronizes those threat endpoints directly into eBPF/XDP kernel maps for wire-speed hardware/driver drops, and exports threat telemetry to `/var/lib/ai-firewall/threat-intel.json`. Inspect with `ai-firewall antivirus`.
 - **Halcyon's sysmode** (the hardening profiles) sets the system posture through `ai-firewall posture`; your config file is not changed.
 - **Luna** can read the firewall ("is my firewall running?" runs `ai-firewall status`) and, only when you have allowed it (her developer-signed capability gate, and admin rights), ban or unban an address and open or close a port.
   Nothing in the firewall can be changed by the model on its own.
@@ -102,7 +103,7 @@ Run it with sudo so it can also see firewall rules and bans.
 
 ## Live tests
 
-`ai-firewall test [health|ports|detector|traffic|services|all] [--json]`, `/test` in the `top` Ask panel, or
+`ai-firewall test [health|ports|detector|traffic|services|antivirus|all] [--json]`, `/test` in the `top` Ask panel, or
 the model asks for one itself (`ACTION: test <name>`; tests are read-only, so they run without a y / n and the
 model explains the results in the same panel):
 
@@ -113,6 +114,8 @@ model explains the results in the same panel):
   packets, and the cost per packet
 - **traffic**: packets passed and dropped per second, new bans, events lost, sampled from the status file
 - **services**: whether the services on your open TCP ports answer on 127.0.0.1
+- **antivirus**: cooperative AI Antivirus companion integration, service states (sensord, engined, responderd),
+  and threat block synchronization into XDP
 
 Safety limits are in the code (`selftest.rs`), not in the prompt: nothing is sent to another host; the only live
 connections go to 127.0.0.1, to at most 16 ports the config opens, one attempt each with a 300 ms timeout;

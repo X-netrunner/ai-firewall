@@ -76,6 +76,8 @@ struct Shared {
     dirty: bool,
     notify_bans: bool,
     notes: BanNotes,
+    antivirus_synced: usize,
+    last_antivirus_sync: u64,
 }
 
 struct Attachment {
@@ -138,6 +140,9 @@ pub struct Status {
     pub posture_error: Option<String>,
     pub bans: Vec<StatusBan>,
     pub recent: Vec<RecentBan>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub antivirus: Option<crate::antivirus::AntivirusStatus>,
+    pub vpn_interfaces: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -229,6 +234,8 @@ pub async fn run(config_path: PathBuf, iface_override: Option<String>) -> anyhow
         dirty: false,
         notify_bans: cfg.notify.bans,
         notes: BanNotes::default(),
+        antivirus_synced: 0,
+        last_antivirus_sync: 0,
     }));
 
     let mut profile = cfg.profile_for(&net::active_connections());
@@ -241,6 +248,9 @@ pub async fn run(config_path: PathBuf, iface_override: Option<String>) -> anyhow
     )?;
     if let Some(p) = &profile {
         info!("[*] network profile: {p}");
+    }
+    if cfg.halcyon.enabled && cfg.halcyon.honeypot_protect {
+        debug!("[*] Halcyon honeypot decoy protection enabled");
     }
     restore(&mut lock(&shared));
     refresh_protection(&cfg, &mut lock(&shared));
@@ -398,9 +408,27 @@ pub async fn run(config_path: PathBuf, iface_override: Option<String>) -> anyhow
                 Err(e) => debug!("vm forwarding check failed: {e:#}"),
             }
         }
+
+        // AI Antivirus cooperative defense: sync C2 threat blocks into XDP eBPF
+        if cfg.antivirus.enabled && cfg.antivirus.sync_blocks && tick.is_multiple_of(5) {
+            let threats = crate::antivirus::fetch_threats();
+            let mut guard = lock(&shared);
+            let s = &mut *guard;
+            let synced = crate::antivirus::sync_threats(&mut s.blocklist, &mut s.records, &threats);
+            s.antivirus_synced = synced;
+            s.last_antivirus_sync = net::unix_secs();
+            if tick.is_multiple_of(20) {
+                let recent: Vec<_> = s.recent.iter().cloned().collect();
+                crate::antivirus::export_telemetry(&recent);
+            }
+        }
+
         {
             let mut s = lock(&shared);
             s.detector.prune(net::boot_secs());
+            if tick.is_multiple_of(SAVE_TICKS) {
+                heal_map_pressure(&mut s);
+            }
             if s.dirty || tick.is_multiple_of(SAVE_TICKS) {
                 save(&mut s);
             }
@@ -1012,8 +1040,8 @@ fn enact(s: &mut Shared, ban: Ban) {
                 );
                 s.dirty = true;
                 warn!(
-                    "[!] [AUTO-BAN] {ip} for {}s: {} on {} (score {:.1}, strike {})",
-                    ban.secs, ban.reason, ban.ports, ban.score, ban.strikes
+                    "[!] [AUTO-BAN] {ip} for {}s: {} on {} (score {:.1}, strike {}, type: {})",
+                    ban.secs, ban.reason, ban.ports, ban.score, ban.strikes, ban.attack_type.label()
                 );
                 history::record(
                     "ban",
@@ -1123,6 +1151,43 @@ fn build_status(
         posture_error: None,
         bans,
         recent: s.recent.iter().cloned().collect(),
+        antivirus: if cfg.antivirus.enabled {
+            Some(crate::antivirus::detect_status(
+                s.antivirus_synced,
+                s.last_antivirus_sync,
+            ))
+        } else {
+            None
+        },
+        vpn_interfaces: net::vpn_interfaces(),
+    }
+}
+
+/// Self-healing: relieves pressure on eBPF blocklist and source tracking maps under flood
+fn heal_map_pressure(s: &mut Shared) {
+    let blocklist_count = s.blocklist.entries().len();
+    if blocklist_count > 50000 {
+        warn!("[!] blocklist map pressure high ({blocklist_count}/65536); initiating self-healing prune");
+        sweep(s);
+        let entries = s.blocklist.entries();
+        if entries.len() > 50000 {
+            for (ip, _) in entries {
+                if let Some(r) = s.records.get(&ip) {
+                    if r.strikes <= 1 && r.source == "auto" {
+                        let _ = s.blocklist.remove(ip);
+                        s.records.remove(&ip);
+                    }
+                }
+                if s.blocklist.entries().len() <= 40000 {
+                    break;
+                }
+            }
+            s.dirty = true;
+            info!("[*] map self-healed: reduced to {} active entries", s.blocklist.entries().len());
+        }
+    }
+    if s.detector.tracked() > 12000 {
+        s.detector.emergency_evict(net::boot_secs(), 8000);
     }
 }
 

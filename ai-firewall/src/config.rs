@@ -105,6 +105,17 @@ base_secs = 120
 max_secs = 86400
 # A source that stays quiet this long gets its strikes reset
 forgive_secs = 21600
+
+# AI Antivirus cooperative defense (active when ai-antivirus companion is installed)
+[antivirus]
+enabled = true
+sync_blocks = true
+sync_interval_secs = 15
+
+# Halcyon desktop companion settings
+[halcyon]
+enabled = true
+honeypot_protect = true
 "#;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -142,9 +153,47 @@ pub struct Config {
     pub profiles: std::collections::BTreeMap<String, Profile>,
     #[serde(default)]
     pub notify: NotifyConfig,
+    #[serde(default)]
+    pub antivirus: AntivirusConfig,
+    #[serde(default)]
+    pub halcyon: HalcyonConfig,
     /// The posture laid over this config (posture.rs), not part of the file
     #[serde(skip)]
     pub posture: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AntivirusConfig {
+    pub enabled: bool,
+    pub sync_blocks: bool,
+    pub sync_interval_secs: u64,
+}
+
+impl Default for AntivirusConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            sync_blocks: true,
+            sync_interval_secs: 15,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct HalcyonConfig {
+    pub enabled: bool,
+    pub honeypot_protect: bool,
+}
+
+impl Default for HalcyonConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            honeypot_protect: true,
+        }
+    }
 }
 
 /// A port or a range: 22 or "1714-1764"

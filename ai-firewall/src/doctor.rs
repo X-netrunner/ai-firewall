@@ -72,6 +72,18 @@ pub const FIXES: &[Fix] = &[
         id: "unban-protected",
         summary: "lift bans on your router, DNS servers, own addresses and VM networks",
     },
+    Fix {
+        id: "start-antivirus",
+        summary: "start or restart ai-antivirus companion services",
+    },
+    Fix {
+        id: "sync-antivirus",
+        summary: "immediately sync threat blocks from ai-antivirus to XDP",
+    },
+    Fix {
+        id: "heal-maps",
+        summary: "prune stale and expired entries to relieve eBPF map pressure",
+    },
 ];
 
 pub fn fix_summary(id: &str) -> Option<&'static str> {
@@ -261,9 +273,12 @@ fn protection() -> crate::detector::Detector {
 pub fn diagnose() -> Vec<Finding> {
     let mut out = Vec::new();
     check_firewall(&mut out);
+    check_antivirus(&mut out);
     check_connectivity(&mut out);
     check_vms(&mut out);
+    check_vpn(&mut out);
     check_bans(&mut out);
+    check_maps(&mut out);
     if !is_root() {
         out.push(finding(
             "doctor",
@@ -274,6 +289,71 @@ pub fn diagnose() -> Vec<Finding> {
         ));
     }
     out
+}
+
+fn check_antivirus(out: &mut Vec<Finding>) {
+    if !crate::antivirus::is_installed() {
+        return;
+    }
+    let status = crate::antivirus::detect_status(0, 0);
+    if !status.active {
+        out.push(finding(
+            "antivirus",
+            Severity::Warn,
+            "AI Antivirus services are inactive",
+            "ai-antivirus is installed as a Halcyon companion, but sensord/engined/responderd are not active",
+            Some("start-antivirus"),
+        ));
+    } else if !status.responderd_active {
+        out.push(finding(
+            "antivirus",
+            Severity::Warn,
+            "AI Antivirus responder is inactive",
+            "ai-antivirus responder daemon is down, so automated process containment and C2 blocks are paused",
+            Some("start-antivirus"),
+        ));
+    } else {
+        out.push(finding(
+            "antivirus",
+            Severity::Ok,
+            "AI Antivirus co-defense active",
+            status.details,
+            None,
+        ));
+    }
+}
+
+fn check_vpn(out: &mut Vec<Finding>) {
+    let vpns = net::vpn_interfaces();
+    if vpns.is_empty() {
+        return;
+    }
+    let list = vpns.join(", ");
+    out.push(finding(
+        "vpn",
+        Severity::Ok,
+        "VPN tunnel interfaces active",
+        format!("detected tunnel(s): {list}; traffic and endpoints protected"),
+        None,
+    ));
+}
+
+fn check_maps(out: &mut Vec<Finding>) {
+    if !is_root() {
+        return;
+    }
+    if let Ok(blocklist) = state::open_pinned_blocklist() {
+        let count = blocklist.entries().len();
+        if count > 55000 {
+            out.push(finding(
+                "firewall",
+                Severity::Warn,
+                "eBPF blocklist map approaching capacity",
+                format!("{count}/65536 entries used in BLOCKLIST map"),
+                Some("heal-maps"),
+            ));
+        }
+    }
 }
 
 fn check_firewall(out: &mut Vec<Finding>) {
@@ -593,6 +673,29 @@ fn action(id: &str) -> Option<Action> {
                 blocklist.remove(*ip)?;
             }
             Ok(format!("lifted {} bans", hits.len()))
+        },
+        "start-antivirus" => || {
+            sh("systemctl", &["restart", "ai-antivirus-sensord", "ai-antivirus-engined", "ai-antivirus-responderd"])
+                .map(|_| "ai-antivirus companion services restarted".into())
+        },
+        "sync-antivirus" => || {
+            let mut blocklist = state::open_pinned_blocklist()?;
+            let mut records = std::collections::HashMap::new();
+            let threats = crate::antivirus::fetch_threats();
+            let count = crate::antivirus::sync_threats(&mut blocklist, &mut records, &threats);
+            Ok(format!("synced {count} threat blocks from ai-antivirus into XDP"))
+        },
+        "heal-maps" => || {
+            let mut blocklist = state::open_pinned_blocklist()?;
+            let entries = blocklist.entries();
+            let mut freed = 0;
+            for (ip, expiry) in entries {
+                if state::remaining(expiry).is_none() {
+                    let _ = blocklist.remove(ip);
+                    freed += 1;
+                }
+            }
+            Ok(format!("freed {freed} expired entries"))
         },
         _ => return None,
     };

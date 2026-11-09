@@ -41,6 +41,15 @@ impl fmt::Display for Src {
     }
 }
 
+impl From<IpAddr> for Src {
+    fn from(ip: IpAddr) -> Self {
+        match ip {
+            IpAddr::V4(v4) => Src::V4(u32::from(v4)),
+            IpAddr::V6(v6) => Src::V6(Src::v6_prefix(v6)),
+        }
+    }
+}
+
 impl FromStr for Src {
     type Err = anyhow::Error;
 

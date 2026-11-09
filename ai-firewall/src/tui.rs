@@ -65,6 +65,10 @@ pub struct StatusView {
     pub posture: Option<String>,
     pub bans: Vec<BanView>,
     pub recent: Vec<RecentView>,
+    #[serde(default)]
+    pub antivirus: Option<crate::antivirus::AntivirusStatus>,
+    #[serde(default)]
+    pub vpn_interfaces: Vec<String>,
 }
 
 /// Ports as strings: "22", "1714-1764" (an older daemon wrote plain numbers)
@@ -960,6 +964,22 @@ fn draw_header(f: &mut Frame, area: Rect, pal: &Pal, s: Option<&StatusView>) {
                 } else {
                     pal.accent2
                 }),
+            ));
+        }
+        if let Some(av) = &s.antivirus {
+            if av.active {
+                spans.push(Span::styled(
+                    format!(" · av: active ({})", av.synced_threats),
+                    Style::default().fg(pal.good),
+                ));
+            } else if av.installed {
+                spans.push(Span::styled(" · av: off", Style::default().fg(pal.warn)));
+            }
+        }
+        if !s.vpn_interfaces.is_empty() {
+            spans.push(Span::styled(
+                format!(" · vpn: {}", s.vpn_interfaces.join(",")),
+                Style::default().fg(pal.accent),
             ));
         }
         if s.config_error.is_some() {

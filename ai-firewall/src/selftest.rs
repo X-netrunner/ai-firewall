@@ -57,6 +57,10 @@ pub const TESTS: &[(&str, &str)] = &[
         "services",
         "local services on open ports answer on 127.0.0.1",
     ),
+    (
+        "antivirus",
+        "cooperative AI Antivirus companion integration, service states and sync",
+    ),
 ];
 
 pub fn is_test(name: &str) -> bool {
@@ -124,6 +128,7 @@ pub fn run(name: &str, traffic_secs: u64) -> Vec<Report> {
         "detector" => detector(&cfg),
         "traffic" => traffic(traffic_secs, StatusView::read),
         "services" => services(&cfg),
+        "antivirus" => test_antivirus(),
         other => {
             let mut r = Report::new(other);
             r.ok = false;
@@ -534,6 +539,41 @@ fn services(cfg: &Config) -> Report {
     r
 }
 
+pub fn test_antivirus() -> Report {
+    let mut r = Report::new("antivirus");
+    if !crate::antivirus::is_installed() {
+        r.ok = true;
+        r.summary = "ai-antivirus is not installed (optional companion)".into();
+        r.stat("installed", "no");
+        return r;
+    }
+    let st = crate::antivirus::detect_status(0, 0);
+    r.ok = st.active;
+    r.summary = if st.active {
+        "co-defense active and running".into()
+    } else {
+        "installed but companion services are inactive".into()
+    };
+    r.stat("installed", "yes");
+    r.stat("sensord", if st.sensord_active { "active" } else { "inactive" });
+    r.stat("engined", if st.engined_active { "active" } else { "inactive" });
+    r.stat("responderd", if st.responderd_active { "active" } else { "inactive" });
+    r.stat(
+        "nft table",
+        if std::process::Command::new("nft")
+            .args(["list", "table", "inet", "ai_antivirus"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            "present"
+        } else {
+            "not loaded"
+        },
+    );
+    r
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -640,6 +680,13 @@ mod tests {
 
     #[test]
     fn known_names() {
-        assert!(is_test("all") && is_test("detector") && !is_test("flood-my-router"));
+        assert!(is_test("all") && is_test("detector") && is_test("antivirus") && !is_test("flood-my-router"));
+    }
+
+    #[test]
+    fn test_antivirus_runs_cleanly() {
+        let r = test_antivirus();
+        assert!(r.test == "antivirus");
+        assert!(!r.stats.is_empty());
     }
 }

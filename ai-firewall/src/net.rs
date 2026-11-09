@@ -117,12 +117,32 @@ pub fn is_virt_bridge(iface: &str) -> bool {
         .any(|p| iface.starts_with(p))
 }
 
+/// True for VPN and tunnel interfaces (WireGuard, Tailscale, OpenVPN, TUN/TAP, Cloudflare WARP)
+pub fn is_vpn(iface: &str) -> bool {
+    [
+        "wg", "tailscale", "tun", "tap", "ppp", "warp", "proton", "mullvad",
+    ]
+    .iter()
+    .any(|p| iface.starts_with(p))
+}
+
 pub fn virt_bridges() -> Vec<String> {
     let mut out: Vec<String> = std::fs::read_dir("/sys/class/net")
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok()?.file_name().into_string().ok())
         .filter(|n| is_virt_bridge(n))
+        .collect();
+    out.sort();
+    out
+}
+
+pub fn vpn_interfaces() -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir("/sys/class/net")
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok()?.file_name().into_string().ok())
+        .filter(|n| is_vpn(n))
         .collect();
     out.sort();
     out
@@ -208,6 +228,13 @@ pub fn auto_protected() -> Vec<Cidr> {
         interface_networks()
             .into_iter()
             .filter(|n| is_virt_bridge(&n.iface))
+            .map(|n| n.net),
+    );
+    // Your own VPN tunnels
+    out.extend(
+        interface_networks()
+            .into_iter()
+            .filter(|n| is_vpn(&n.iface))
             .map(|n| n.net),
     );
     out
