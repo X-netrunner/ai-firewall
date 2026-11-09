@@ -175,3 +175,8 @@ pub fn attach_tc(program: &mut SchedClassifier, iface: &str, ifindex: u32) -> an
     write_meta("tc", iface, ifindex, "tcx");
     Ok(())
 }
+
+/// A missing pin means our durable attachment has been lost and needs repair.
+pub fn is_pinned(kind: &str, iface: &str) -> bool {
+    PinnedLink::from_pin(pin_path(kind, iface)).is_ok()
+}

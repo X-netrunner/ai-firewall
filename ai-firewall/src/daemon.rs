@@ -16,7 +16,7 @@ use std::{
     collections::{HashMap as StdHashMap, HashSet, VecDeque},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use ai_firewall_common::{
@@ -34,7 +34,7 @@ use aya::{
     programs::{SchedClassifier, Xdp},
 };
 use log::{debug, error, info, warn};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::signal::unix::{SignalKind, signal};
 
 use crate::{
@@ -84,6 +84,8 @@ struct Attachment {
     mode: String,
     /// The egress program is attached, so strict UDP can safely be switched on
     egress: bool,
+    egress_retry: Instant,
+    egress_failures: u32,
 }
 
 const PINNED_MAPS: [&str; 4] = ["BLOCKLIST", "BLOCKLIST6", "UDP_FLOWS", "UDP_FLOWS6"];
@@ -111,6 +113,7 @@ pub struct Status {
     pub interface: Option<String>,
     pub xdp_mode: Option<String>,
     pub udp_strict: bool,
+    pub udp_strict_requested: Option<bool>,
     pub started_unix: u64,
     pub updated_unix: u64,
     pub attaches: u64,
@@ -507,9 +510,41 @@ fn heal(
         Some(cfg.interface.clone())
     };
 
-    if let Some(a) = attachment.as_ref() {
+    if let Some(a) = attachment.as_mut() {
         let current = net::ifindex(&a.iface);
-        if wanted.as_deref() == Some(a.iface.as_str()) && current == Some(a.ifindex) {
+        if wanted.as_deref() == Some(a.iface.as_str())
+            && current == Some(a.ifindex)
+            && links::is_pinned("xdp", &a.iface)
+        {
+            if !a.egress || !links::is_pinned("tc", &a.iface) {
+                a.egress = false;
+                if Instant::now() < a.egress_retry {
+                    return Ok(false);
+                }
+                match links::attach_tc(tc_program(ebpf)?, &a.iface, a.ifindex) {
+                    Ok(()) => {
+                        a.egress = true;
+                        a.egress_failures = 0;
+                        record_egress(&a.iface, 0, 0);
+                        info!("[*] restored egress tracking on {}", a.iface);
+                    }
+                    Err(e) => {
+                        a.egress_failures = a.egress_failures.saturating_add(1);
+                        let delay = repair_delay(a.egress_failures);
+                        a.egress_retry = Instant::now() + delay;
+                        record_egress(
+                            &a.iface,
+                            a.egress_failures,
+                            net::unix_secs() + delay.as_secs(),
+                        );
+                        warn!(
+                            "[!] egress repair pending on {}: {e:#}; retry in {}s",
+                            a.iface,
+                            delay.as_secs()
+                        );
+                    }
+                }
+            }
             return Ok(false);
         }
         let a = attachment.take().unwrap();
@@ -536,11 +571,28 @@ fn heal(
     }
 
     // Egress first, so flows are being recorded before strict UDP checks them
-    let egress = match links::attach_tc(tc_program(ebpf)?, &iface, ifindex) {
-        Ok(()) => true,
-        Err(e) => {
-            warn!("[!] {e:#}; UDP falls back to the looser ephemeral-port rule");
-            false
+    let saved = load_egress(&iface);
+    let wait = saved.retry_unix.saturating_sub(net::unix_secs()).min(120);
+    let mut failures = saved.failures;
+    let egress = if wait > 0 {
+        false
+    } else {
+        match links::attach_tc(tc_program(ebpf)?, &iface, ifindex) {
+            Ok(()) => {
+                failures = 0;
+                record_egress(&iface, 0, 0);
+                true
+            }
+            Err(e) => {
+                failures = failures.saturating_add(1);
+                record_egress(
+                    &iface,
+                    failures,
+                    net::unix_secs() + repair_delay(failures).as_secs(),
+                );
+                warn!("[!] {e:#}; UDP falls back to the looser ephemeral-port rule");
+                false
+            }
         }
     };
     match links::attach_xdp(xdp_program(ebpf)?, &iface, ifindex) {
@@ -555,6 +607,13 @@ fn heal(
                 ifindex,
                 mode,
                 egress,
+                egress_retry: Instant::now()
+                    + if wait > 0 {
+                        Duration::from_secs(wait)
+                    } else {
+                        repair_delay(failures)
+                    },
+                egress_failures: failures,
             });
             Ok(true)
         }
@@ -1041,6 +1100,7 @@ fn build_status(
         interface: attachment.map(|a| a.iface.clone()),
         xdp_mode: attachment.map(|a| a.mode.clone()),
         udp_strict: cfg.udp_strict && attachment.is_some_and(|a| a.egress),
+        udp_strict_requested: Some(cfg.udp_strict),
         started_unix: started,
         updated_unix: net::unix_secs(),
         attaches,
@@ -1119,5 +1179,62 @@ limit = "6/60s"
             c.tcp.contains(&22),
             "a limited rule without `from` still opens the port"
         );
+    }
+}
+
+fn repair_delay(failures: u32) -> Duration {
+    Duration::from_secs((3u64 << failures.min(6)).min(120))
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    #[test]
+    fn repair_backoff_is_bounded() {
+        assert_eq!(super::repair_delay(1).as_secs(), 6);
+        assert_eq!(super::repair_delay(2).as_secs(), 12);
+        assert_eq!(super::repair_delay(u32::MAX).as_secs(), 120);
+        let state = super::EgressRecovery { failures: 4, retry_unix: 1234 };
+        let bytes = serde_json::to_vec(&state).unwrap();
+        let restored: super::EgressRecovery = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.failures, 4);
+        assert_eq!(restored.retry_unix, 1234);
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct EgressRecovery {
+    failures: u32,
+    retry_unix: u64,
+}
+
+fn recovery_path(iface: &str) -> PathBuf {
+    Path::new("/var/lib/ai-firewall/links").join(format!("recovery-{iface}.json"))
+}
+
+fn load_egress(iface: &str) -> EgressRecovery {
+    match std::fs::read(recovery_path(iface)) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+            warn!("Cannot read egress repair history for {iface}: {e}");
+            EgressRecovery::default()
+        }),
+        Err(e) => {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                warn!("Cannot load egress repair history for {iface}: {e}");
+            }
+            EgressRecovery::default()
+        }
+    }
+}
+
+fn record_egress(iface: &str, failures: u32, retry_unix: u64) {
+    let state = EgressRecovery {
+        failures,
+        retry_unix,
+    };
+    let result = serde_json::to_vec(&state)
+        .map_err(anyhow::Error::from)
+        .and_then(|bytes| state::write_atomic(&recovery_path(iface), &bytes));
+    if let Err(e) = result {
+        warn!("Cannot persist egress repair history for {iface}: {e}");
     }
 }

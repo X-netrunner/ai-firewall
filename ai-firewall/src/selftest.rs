@@ -150,13 +150,19 @@ fn health(s: Option<&StatusView>) -> Report {
     };
     let age = unix_secs().saturating_sub(s.updated_unix);
     let alive = s.alive();
-    r.ok = alive && s.config_error.is_none() && s.interface.is_some();
+    let degraded = s.udp_strict_requested == Some(true) && !s.udp_strict;
+    r.ok = alive && s.config_error.is_none() && s.interface.is_some() && !degraded;
     r.summary = match (alive, &s.interface, &s.config_error) {
         (false, _, _) => "daemon not responding".into(),
         (_, None, _) => "no uplink: the filter is not attached".into(),
         (_, _, Some(_)) => "config error, last good config in force".into(),
         _ => format!("{} on {}", s.mode, s.interface.as_deref().unwrap_or("-")),
     };
+    if alive && degraded {
+        r.summary = "degraded: strict UDP requested but egress recovery is incomplete".into();
+    }
+    r.stat("strict UDP requested", s.udp_strict_requested.map_or("unknown (older daemon)", |v| if v { "yes" } else { "no" }));
+    r.stat("strict UDP active", s.udp_strict);
     r.stat("status age", format!("{age}s"));
     r.stat(
         "uptime",
@@ -621,6 +627,15 @@ mod tests {
     #[test]
     fn health_without_daemon_fails() {
         assert!(!health(None).ok);
+        let status = StatusView {
+            pid: std::process::id(), updated_unix: unix_secs(),
+            interface: Some("test".into()), udp_strict_requested: Some(true),
+            udp_strict: false, ..Default::default()
+        };
+        assert!(!health(Some(&status)).ok);
+        assert!(health(Some(&status)).summary.contains("degraded"));
+        let restored = StatusView { udp_strict: true, ..status };
+        assert!(health(Some(&restored)).ok);
     }
 
     #[test]

@@ -42,6 +42,7 @@ pub struct StatusView {
     pub interface: Option<String>,
     pub xdp_mode: Option<String>,
     pub udp_strict: bool,
+    pub udp_strict_requested: Option<bool>,
     pub started_unix: u64,
     pub updated_unix: u64,
     pub attaches: u64,
@@ -167,16 +168,16 @@ struct Pal {
 impl Pal {
     fn halcyon_default() -> Self {
         Self {
-            bg: hex("#14161f").unwrap(),
-            surface: hex("#1e2130").unwrap(),
-            surface_hi: hex("#272b3d").unwrap(),
-            accent: hex("#9aa9d4").unwrap(),
-            accent2: hex("#c2add8").unwrap(),
-            text: hex("#dcdde8").unwrap(),
-            muted: hex("#9496a8").unwrap(),
-            good: hex("#8fd6a8").unwrap(),
-            bad: hex("#f2879b").unwrap(),
-            warn: hex("#f0c27b").unwrap(),
+            bg: hex("#1e1e2e").unwrap(),
+            surface: hex("#313244").unwrap(),
+            surface_hi: hex("#45475a").unwrap(),
+            accent: hex("#89b4fa").unwrap(),
+            accent2: hex("#cba6f7").unwrap(),
+            text: hex("#cdd6f4").unwrap(),
+            muted: hex("#a6adc8").unwrap(),
+            good: hex("#a6e3a1").unwrap(),
+            bad: hex("#f38ba8").unwrap(),
+            warn: hex("#f9e2af").unwrap(),
         }
     }
 
@@ -663,13 +664,28 @@ fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     f.render_widget(Block::default().style(Style::default().bg(pal.bg)), area);
 
+    if area.width < 64 || area.height < 22 {
+        let message = format!(
+            "Window too small: {} × {}\n\nResize to at least 64 × 22 to view the dashboard.\nMonitoring continues. Press q to quit.",
+            area.width, area.height
+        );
+        f.render_widget(
+            Paragraph::new(message)
+                .style(Style::default().fg(pal.text))
+                .wrap(ratatui::widgets::Wrap { trim: false })
+                .block(pane("ai-firewall", &pal)),
+            area,
+        );
+        return;
+    }
+
     let chatting = app.chat.is_some();
     let [header, tiles, graph, body, footer] = Layout::vertical([
         Constraint::Length(4),
         Constraint::Length(4),
         Constraint::Length(if chatting { 0 } else { 6 }),
         Constraint::Min(6),
-        Constraint::Length(1),
+        Constraint::Length(2),
     ])
     .areas(area.inner(ratatui::layout::Margin {
         horizontal: 1,
@@ -1229,7 +1245,7 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             label(" ask  "),
             key("q"),
             label(" quit"),
-        ])),
+        ])).wrap(ratatui::widgets::Wrap { trim: false }),
         area,
     );
 }
