@@ -95,6 +95,11 @@ enum Cmd {
         #[arg(long, default_value_t = rollback::DEFAULT_SECS)]
         rollback_secs: u64,
     },
+    /// One status record for Halcyon (halcyon.status/1)
+    Health {
+        #[arg(long)]
+        json: bool,
+    },
     /// Keep the change that is waiting for confirmation
     Confirm,
     /// Undo the change that is waiting for confirmation (the timer runs this)
@@ -251,6 +256,25 @@ async fn main() -> anyhow::Result<()> {
             dry_run,
             rollback_secs,
         } => close_port(&opt.config, &proto, &port, dry_run, rollback_secs),
+        Cmd::Health { .. } => {
+            let age = std::fs::metadata(state::STATUS_FILE)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok());
+            let (state, detail) = match age {
+                Some(a) if a.as_secs() <= 15 => ("ok", "filtering; status is fresh".to_string()),
+                Some(a) => (
+                    "degraded",
+                    format!("status is {} s old: is the service stuck?", a.as_secs()),
+                ),
+                None => ("down", "the service is not running".to_string()),
+            };
+            println!(
+                r#"{{"schema":"halcyon.status/1","component":"ai-firewall","version":"{}","contract":1,"state":"{state}","detail":"{detail}"}}"#,
+                env!("CARGO_PKG_VERSION")
+            );
+            Ok(())
+        }
         Cmd::Confirm => {
             need_root()?;
             rollback::cancel_timer();
