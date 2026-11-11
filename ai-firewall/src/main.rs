@@ -409,28 +409,28 @@ fn status(json: bool) -> anyhow::Result<()> {
         duration(n("updated_unix").saturating_sub(n("started_unix")).max(1)),
         n("attaches"),
     );
-    if let Some(av) = s.get("antivirus") {
-        if av["installed"].as_bool() == Some(true) {
-            let active = av["active"].as_bool() == Some(true);
-            let synced = av["synced_threats"].as_u64().unwrap_or(0);
-            println!(
-                "  antivirus  {} ({synced} threat blocks synced to XDP)",
-                if active {
-                    "co-defense active"
-                } else {
-                    "companion inactive"
-                }
-            );
-        }
+    if let Some(av) = s.get("antivirus")
+        && av["installed"].as_bool() == Some(true)
+    {
+        let active = av["active"].as_bool() == Some(true);
+        let synced = av["synced_threats"].as_u64().unwrap_or(0);
+        println!(
+            "  antivirus  {} ({synced} threat blocks synced to XDP)",
+            if active {
+                "co-defense active"
+            } else {
+                "companion inactive"
+            }
+        );
     }
-    if let Some(vpns) = s.get("vpn_interfaces").and_then(|v| v.as_array()) {
-        if !vpns.is_empty() {
-            let names: Vec<&str> = vpns.iter().filter_map(|v| v.as_str()).collect();
-            println!(
-                "  vpn        {} (traffic and endpoints protected)",
-                names.join(", ")
-            );
-        }
+    if let Some(vpns) = s.get("vpn_interfaces").and_then(|v| v.as_array())
+        && !vpns.is_empty()
+    {
+        let names: Vec<&str> = vpns.iter().filter_map(|v| v.as_str()).collect();
+        println!(
+            "  vpn        {} (traffic and endpoints protected)",
+            names.join(", ")
+        );
     }
     if let Some(p) = s["posture"].as_str() {
         println!("  posture    {p} (ai-firewall posture)");

@@ -1179,11 +1179,12 @@ fn heal_map_pressure(s: &mut Shared) {
         let entries = s.blocklist.entries();
         if entries.len() > 50000 {
             for (ip, _) in entries {
-                if let Some(r) = s.records.get(&ip) {
-                    if r.strikes <= 1 && r.source == "auto" {
-                        let _ = s.blocklist.remove(ip);
-                        s.records.remove(&ip);
-                    }
+                if let Some(r) = s.records.get(&ip)
+                    && r.strikes <= 1
+                    && r.source == "auto"
+                {
+                    let _ = s.blocklist.remove(ip);
+                    s.records.remove(&ip);
                 }
                 if s.blocklist.entries().len() <= 40000 {
                     break;
