@@ -185,10 +185,9 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Top { ask } => tui::run(ask),
         Cmd::Ban { ip, minutes, force } => {
             need_root()?;
-            if !force
-                && let Some(why) = guard::Lifelines::read().why_not(ip) {
-                    bail!("not banning: {why} (use --force if you really mean it)");
-                }
+            if !force && let Some(why) = guard::Lifelines::read().why_not(ip) {
+                bail!("not banning: {why} (use --force if you really mean it)");
+            }
             let mut blocklist = state::open_pinned_blocklist()?;
             blocklist.insert(ip, state::expiry_for(minutes * 60))?;
             match minutes {
@@ -888,12 +887,8 @@ fn close_port(
 ) -> anyhow::Result<()> {
     let port = port_spec(port);
     if dry_run {
-        let scratch =
-            std::env::temp_dir().join(format!("ai-firewall-dry-run-{}.toml", std::process::id()));
-        std::fs::copy(config_path, &scratch)?;
-        let open = config::set_port(&scratch, proto, &port, false);
-        let _ = std::fs::remove_file(&scratch);
-        match open? {
+        let text = std::fs::read_to_string(config_path)?;
+        match config::set_port_text(&text, proto, &port, false)?.is_some() {
             true => println!("would close {proto} {port} (undone after {secs} s unless confirmed)"),
             false => println!("{proto} {port} isn't open: nothing would change"),
         }

@@ -650,14 +650,30 @@ impl Config {
 /// Opens or closes a port by editing the config file in place (comments survive);
 /// the daemon notices the change within a tick
 pub fn set_port(path: &Path, proto: &str, port: &PortSpec, open: bool) -> anyhow::Result<bool> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    match set_port_text(&text, proto, port, open)? {
+        Some(new) => {
+            crate::state::write_atomic(path, new.as_bytes())?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// The config text with the port opened or closed, or None when nothing changes
+pub fn set_port_text(
+    text: &str,
+    proto: &str,
+    port: &PortSpec,
+    open: bool,
+) -> anyhow::Result<Option<String>> {
     port.ports()?;
     let key = match proto {
         "tcp" => "allow_tcp",
         "udp" => "allow_udp",
         _ => bail!("protocol must be tcp or udp"),
     };
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut doc: toml_edit::DocumentMut = text.parse()?;
     if doc.get(key).is_none() {
         doc[key] = toml_edit::value(toml_edit::Array::new());
@@ -683,12 +699,12 @@ pub fn set_port(path: &Path, proto: &str, port: &PortSpec, open: bool) -> anyhow
         }
         _ => false,
     };
-    if changed {
-        let new = doc.to_string();
-        Config::parse(&new)?;
-        crate::state::write_atomic(path, new.as_bytes())?;
+    if !changed {
+        return Ok(None);
     }
-    Ok(changed)
+    let new = doc.to_string();
+    Config::parse(&new)?;
+    Ok(Some(new))
 }
 
 #[cfg(test)]
