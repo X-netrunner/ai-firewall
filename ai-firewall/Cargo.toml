@@ -36,3 +36,6 @@ cargo_metadata = { workspace = true }
 [[bin]]
 name = "ai-firewall"
 path = "src/main.rs"
+
+[dev-dependencies]
+tempfile = "3"

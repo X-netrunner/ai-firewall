@@ -11,10 +11,12 @@ mod daemon;
 mod detector;
 mod doctor;
 mod feeds;
+mod guard;
 mod history;
 mod links;
 mod net;
 mod posture;
+mod rollback;
 mod selftest;
 mod state;
 mod tui;
@@ -74,13 +76,29 @@ enum Cmd {
         /// Minutes; 0 bans until unbanned
         #[arg(short, long, default_value_t = 60)]
         minutes: u64,
+        /// Ban it even if it is this machine, its gateway or an open SSH session
+        #[arg(long)]
+        force: bool,
     },
     /// Lift a ban
     Unban { ip: addr::Src },
     /// Open an inbound port or range, e.g. `open tcp 22` or `open tcp 1714-1764` (edits the config)
     Open { proto: String, port: String },
     /// Close an inbound port or range (edits the config)
-    Close { proto: String, port: String },
+    Close {
+        proto: String,
+        port: String,
+        /// Only show what would change
+        #[arg(long)]
+        dry_run: bool,
+        /// Seconds before the change is undone unless confirmed
+        #[arg(long, default_value_t = rollback::DEFAULT_SECS)]
+        rollback_secs: u64,
+    },
+    /// Keep the change that is waiting for confirmation
+    Confirm,
+    /// Undo the change that is waiting for confirmation (the timer runs this)
+    Rollback,
     /// What the firewall did lately: bans, lifts, profile switches, feed updates
     History {
         /// How many entries
@@ -165,8 +183,12 @@ async fn main() -> anyhow::Result<()> {
         Cmd::Status { json } => status(json),
         Cmd::Antivirus { json } => antivirus_cmd(json),
         Cmd::Top { ask } => tui::run(ask),
-        Cmd::Ban { ip, minutes } => {
+        Cmd::Ban { ip, minutes, force } => {
             need_root()?;
+            if !force
+                && let Some(why) = guard::Lifelines::read().why_not(ip) {
+                    bail!("not banning: {why} (use --force if you really mean it)");
+                }
             let mut blocklist = state::open_pinned_blocklist()?;
             blocklist.insert(ip, state::expiry_for(minutes * 60))?;
             match minutes {
@@ -224,12 +246,30 @@ async fn main() -> anyhow::Result<()> {
             }
             Ok(())
         }
-        Cmd::Close { proto, port } => {
+        Cmd::Close {
+            proto,
+            port,
+            dry_run,
+            rollback_secs,
+        } => close_port(&opt.config, &proto, &port, dry_run, rollback_secs),
+        Cmd::Confirm => {
             need_root()?;
-            let port = port_spec(&port);
-            match config::set_port(&opt.config, &proto, &port, false)? {
-                true => println!("closed {proto} {port}"),
-                false => println!("{proto} {port} wasn't open"),
+            rollback::cancel_timer();
+            match rollback::confirm(std::path::Path::new(rollback::PENDING))? {
+                Some(what) => println!("kept: {what}"),
+                None => println!("nothing is waiting for confirmation"),
+            }
+            Ok(())
+        }
+        Cmd::Rollback => {
+            need_root()?;
+            rollback::cancel_timer();
+            match rollback::rollback(std::path::Path::new(rollback::PENDING))? {
+                Some(what) => {
+                    history::record("rollback", "-", format!("undid: {what}"));
+                    println!("undone: {what}")
+                }
+                None => println!("nothing to undo"),
             }
             Ok(())
         }
@@ -837,4 +877,62 @@ fn port_spec(s: &str) -> config::PortSpec {
     s.parse()
         .map(config::PortSpec::One)
         .unwrap_or_else(|_| config::PortSpec::Text(s.to_string()))
+}
+
+fn close_port(
+    config_path: &std::path::Path,
+    proto: &str,
+    port: &str,
+    dry_run: bool,
+    secs: u64,
+) -> anyhow::Result<()> {
+    let port = port_spec(port);
+    if dry_run {
+        let scratch =
+            std::env::temp_dir().join(format!("ai-firewall-dry-run-{}.toml", std::process::id()));
+        std::fs::copy(config_path, &scratch)?;
+        let open = config::set_port(&scratch, proto, &port, false);
+        let _ = std::fs::remove_file(&scratch);
+        match open? {
+            true => println!("would close {proto} {port} (undone after {secs} s unless confirmed)"),
+            false => println!("{proto} {port} isn't open: nothing would change"),
+        }
+        return Ok(());
+    }
+    need_root()?;
+    let previous = std::fs::read_to_string(config_path)?;
+    if !config::set_port(config_path, proto, &port, false)? {
+        println!("{proto} {port} wasn't open");
+        return Ok(());
+    }
+    let pending = rollback::Pending {
+        config: config_path.to_path_buf(),
+        previous: previous.clone(),
+        what: format!("close {proto} {port}"),
+    };
+    if let Err(e) = rollback::arm(
+        std::path::Path::new(rollback::PENDING),
+        &pending,
+        secs,
+        rollback::systemd_timer,
+    ) {
+        state::write_atomic(config_path, previous.as_bytes())?;
+        bail!("{e:#}; {proto} {port} was left open");
+    }
+    println!("closed {proto} {port}");
+    let pending_file = std::path::Path::new(rollback::PENDING);
+    match rollback::ask_to_keep(secs) {
+        Some(true) => {
+            rollback::cancel_timer();
+            rollback::confirm(pending_file)?;
+            println!("kept");
+        }
+        Some(false) => {
+            rollback::cancel_timer();
+            rollback::rollback(pending_file)?;
+            println!("undone: {proto} {port} is open again");
+        }
+        None => println!("it will be undone in {secs} s unless you run: sudo ai-firewall confirm"),
+    }
+    Ok(())
 }

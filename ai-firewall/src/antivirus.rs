@@ -115,7 +115,6 @@ pub fn is_installed() -> bool {
         .unwrap_or(false)
         || Path::new("/usr/local/bin/ai-antivirus").exists()
         || Path::new("/usr/bin/ai-antivirus").exists()
-        || Path::new("/home/netrunner/.local/bin/ai-antivirus").exists()
         || Path::new("/etc/ai-antivirus/ai-antivirus.toml").exists()
 }
 
