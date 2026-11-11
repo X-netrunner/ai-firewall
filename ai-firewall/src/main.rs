@@ -286,8 +286,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Cmd::Rollback => {
             need_root()?;
+            let undone = rollback::rollback(std::path::Path::new(rollback::PENDING))?;
             rollback::cancel_timer();
-            match rollback::rollback(std::path::Path::new(rollback::PENDING))? {
+            match undone {
                 Some(what) => {
                     history::record("rollback", "-", format!("undid: {what}"));
                     println!("undone: {what}")
@@ -947,8 +948,8 @@ fn close_port(
             println!("kept");
         }
         Some(false) => {
-            rollback::cancel_timer();
             rollback::rollback(pending_file)?;
+            rollback::cancel_timer();
             println!("undone: {proto} {port} is open again");
         }
         None => println!("it will be undone in {secs} s unless you run: sudo ai-firewall confirm"),
