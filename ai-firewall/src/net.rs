@@ -120,7 +120,14 @@ pub fn is_virt_bridge(iface: &str) -> bool {
 /// True for VPN and tunnel interfaces (WireGuard, Tailscale, OpenVPN, TUN/TAP, Cloudflare WARP)
 pub fn is_vpn(iface: &str) -> bool {
     [
-        "wg", "tailscale", "tun", "tap", "ppp", "warp", "proton", "mullvad",
+        "wg",
+        "tailscale",
+        "tun",
+        "tap",
+        "ppp",
+        "warp",
+        "proton",
+        "mullvad",
     ]
     .iter()
     .any(|p| iface.starts_with(p))
@@ -257,7 +264,10 @@ mod tests {
 
     #[test]
     fn truncated_route_does_not_panic() {
-        assert_eq!(parse_default_route("header\neth0 00000000 0100007F 0003 0 0 100\n"), None);
+        assert_eq!(
+            parse_default_route("header\neth0 00000000 0100007F 0003 0 0 100\n"),
+            None
+        );
     }
 
     #[test]

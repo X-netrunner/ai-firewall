@@ -415,14 +415,21 @@ fn status(json: bool) -> anyhow::Result<()> {
             let synced = av["synced_threats"].as_u64().unwrap_or(0);
             println!(
                 "  antivirus  {} ({synced} threat blocks synced to XDP)",
-                if active { "co-defense active" } else { "companion inactive" }
+                if active {
+                    "co-defense active"
+                } else {
+                    "companion inactive"
+                }
             );
         }
     }
     if let Some(vpns) = s.get("vpn_interfaces").and_then(|v| v.as_array()) {
         if !vpns.is_empty() {
             let names: Vec<&str> = vpns.iter().filter_map(|v| v.as_str()).collect();
-            println!("  vpn        {} (traffic and endpoints protected)", names.join(", "));
+            println!(
+                "  vpn        {} (traffic and endpoints protected)",
+                names.join(", ")
+            );
         }
     }
     if let Some(p) = s["posture"].as_str() {
@@ -527,13 +534,16 @@ fn antivirus_cmd(json: bool) -> anyhow::Result<()> {
     let threats = antivirus::fetch_threats();
     let status = antivirus::detect_status(threats.len(), net::unix_secs());
     if json {
-        let threat_list: Vec<Value> = threats.iter().map(|t| {
-            serde_json::json!({
-                "ip": t.ip.to_string(),
-                "ttl_secs": t.ttl_secs,
-                "reason": t.reason,
+        let threat_list: Vec<Value> = threats
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "ip": t.ip.to_string(),
+                    "ttl_secs": t.ttl_secs,
+                    "reason": t.reason,
+                })
             })
-        }).collect();
+            .collect();
         let payload = serde_json::json!({
             "status": status,
             "threats": threat_list,
@@ -542,12 +552,28 @@ fn antivirus_cmd(json: bool) -> anyhow::Result<()> {
         return Ok(());
     }
     println!("AI Antivirus Co-defense Mesh");
-    println!("  installed  {}", if status.installed { "yes" } else { "no" });
+    println!(
+        "  installed  {}",
+        if status.installed { "yes" } else { "no" }
+    );
     println!("  status     {}", status.details);
-    println!("  services   sensord={}, engined={}, responderd={}",
-        if status.sensord_active { "active" } else { "inactive" },
-        if status.engined_active { "active" } else { "inactive" },
-        if status.responderd_active { "active" } else { "inactive" },
+    println!(
+        "  services   sensord={}, engined={}, responderd={}",
+        if status.sensord_active {
+            "active"
+        } else {
+            "inactive"
+        },
+        if status.engined_active {
+            "active"
+        } else {
+            "inactive"
+        },
+        if status.responderd_active {
+            "active"
+        } else {
+            "inactive"
+        },
     );
     println!("\nsynced threat blocks ({})", threats.len());
     for t in &threats {

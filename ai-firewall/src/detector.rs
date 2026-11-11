@@ -198,7 +198,10 @@ impl Detector {
         if ev.verdict == VERDICT_DROP_POLICY && !is_discovery {
             track.drops += 1;
         }
-        if !is_discovery && track.ports.len() <= cfg.port_limit as usize && !track.ports.contains(&ev.dst_port) {
+        if !is_discovery
+            && track.ports.len() <= cfg.port_limit as usize
+            && !track.ports.contains(&ev.dst_port)
+        {
             track.ports.push(ev.dst_port);
         }
 

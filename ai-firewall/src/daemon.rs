@@ -1041,7 +1041,12 @@ fn enact(s: &mut Shared, ban: Ban) {
                 s.dirty = true;
                 warn!(
                     "[!] [AUTO-BAN] {ip} for {}s: {} on {} (score {:.1}, strike {}, type: {})",
-                    ban.secs, ban.reason, ban.ports, ban.score, ban.strikes, ban.attack_type.label()
+                    ban.secs,
+                    ban.reason,
+                    ban.ports,
+                    ban.score,
+                    ban.strikes,
+                    ban.attack_type.label()
                 );
                 history::record(
                     "ban",
@@ -1167,7 +1172,9 @@ fn build_status(
 fn heal_map_pressure(s: &mut Shared) {
     let blocklist_count = s.blocklist.entries().len();
     if blocklist_count > 50000 {
-        warn!("[!] blocklist map pressure high ({blocklist_count}/65536); initiating self-healing prune");
+        warn!(
+            "[!] blocklist map pressure high ({blocklist_count}/65536); initiating self-healing prune"
+        );
         sweep(s);
         let entries = s.blocklist.entries();
         if entries.len() > 50000 {
@@ -1183,7 +1190,10 @@ fn heal_map_pressure(s: &mut Shared) {
                 }
             }
             s.dirty = true;
-            info!("[*] map self-healed: reduced to {} active entries", s.blocklist.entries().len());
+            info!(
+                "[*] map self-healed: reduced to {} active entries",
+                s.blocklist.entries().len()
+            );
         }
     }
     if s.detector.tracked() > 12000 {
@@ -1258,7 +1268,10 @@ mod recovery_tests {
         assert_eq!(super::repair_delay(1).as_secs(), 6);
         assert_eq!(super::repair_delay(2).as_secs(), 12);
         assert_eq!(super::repair_delay(u32::MAX).as_secs(), 120);
-        let state = super::EgressRecovery { failures: 4, retry_unix: 1234 };
+        let state = super::EgressRecovery {
+            failures: 4,
+            retry_unix: 1234,
+        };
         let bytes = serde_json::to_vec(&state).unwrap();
         let restored: super::EgressRecovery = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(restored.failures, 4);

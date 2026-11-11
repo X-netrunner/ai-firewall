@@ -166,7 +166,11 @@ fn health(s: Option<&StatusView>) -> Report {
     if alive && degraded {
         r.summary = "degraded: strict UDP requested but egress recovery is incomplete".into();
     }
-    r.stat("strict UDP requested", s.udp_strict_requested.map_or("unknown (older daemon)", |v| if v { "yes" } else { "no" }));
+    r.stat(
+        "strict UDP requested",
+        s.udp_strict_requested
+            .map_or("unknown (older daemon)", |v| if v { "yes" } else { "no" }),
+    );
     r.stat("strict UDP active", s.udp_strict);
     r.stat("status age", format!("{age}s"));
     r.stat(
@@ -555,9 +559,30 @@ pub fn test_antivirus() -> Report {
         "installed but companion services are inactive".into()
     };
     r.stat("installed", "yes");
-    r.stat("sensord", if st.sensord_active { "active" } else { "inactive" });
-    r.stat("engined", if st.engined_active { "active" } else { "inactive" });
-    r.stat("responderd", if st.responderd_active { "active" } else { "inactive" });
+    r.stat(
+        "sensord",
+        if st.sensord_active {
+            "active"
+        } else {
+            "inactive"
+        },
+    );
+    r.stat(
+        "engined",
+        if st.engined_active {
+            "active"
+        } else {
+            "inactive"
+        },
+    );
+    r.stat(
+        "responderd",
+        if st.responderd_active {
+            "active"
+        } else {
+            "inactive"
+        },
+    );
     r.stat(
         "nft table",
         if std::process::Command::new("nft")
@@ -668,19 +693,30 @@ mod tests {
     fn health_without_daemon_fails() {
         assert!(!health(None).ok);
         let status = StatusView {
-            pid: std::process::id(), updated_unix: unix_secs(),
-            interface: Some("test".into()), udp_strict_requested: Some(true),
-            udp_strict: false, ..Default::default()
+            pid: std::process::id(),
+            updated_unix: unix_secs(),
+            interface: Some("test".into()),
+            udp_strict_requested: Some(true),
+            udp_strict: false,
+            ..Default::default()
         };
         assert!(!health(Some(&status)).ok);
         assert!(health(Some(&status)).summary.contains("degraded"));
-        let restored = StatusView { udp_strict: true, ..status };
+        let restored = StatusView {
+            udp_strict: true,
+            ..status
+        };
         assert!(health(Some(&restored)).ok);
     }
 
     #[test]
     fn known_names() {
-        assert!(is_test("all") && is_test("detector") && is_test("antivirus") && !is_test("flood-my-router"));
+        assert!(
+            is_test("all")
+                && is_test("detector")
+                && is_test("antivirus")
+                && !is_test("flood-my-router")
+        );
     }
 
     #[test]

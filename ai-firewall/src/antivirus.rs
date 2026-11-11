@@ -186,7 +186,10 @@ pub fn parse_nft_set_json(json_str: &str) -> Option<Vec<ThreatBlock>> {
                 }
             } else if let Some(inner) = elem.get("elem") {
                 let val_str = inner.get("val").and_then(|v| v.as_str());
-                let timeout = inner.get("timeout").and_then(|t| t.as_u64()).unwrap_or(3600);
+                let timeout = inner
+                    .get("timeout")
+                    .and_then(|t| t.as_u64())
+                    .unwrap_or(3600);
                 if let Some(ip_str) = val_str
                     && let Ok(ip) = ip_str.parse::<IpAddr>()
                 {

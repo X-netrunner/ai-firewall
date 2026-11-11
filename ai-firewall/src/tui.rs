@@ -1265,7 +1265,8 @@ fn draw_footer(f: &mut Frame, area: Rect, app: &App) {
             label(" ask  "),
             key("q"),
             label(" quit"),
-        ])).wrap(ratatui::widgets::Wrap { trim: false }),
+        ]))
+        .wrap(ratatui::widgets::Wrap { trim: false }),
         area,
     );
 }

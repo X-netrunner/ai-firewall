@@ -675,15 +675,25 @@ fn action(id: &str) -> Option<Action> {
             Ok(format!("lifted {} bans", hits.len()))
         },
         "start-antivirus" => || {
-            sh("systemctl", &["restart", "ai-antivirus-sensord", "ai-antivirus-engined", "ai-antivirus-responderd"])
-                .map(|_| "ai-antivirus companion services restarted".into())
+            sh(
+                "systemctl",
+                &[
+                    "restart",
+                    "ai-antivirus-sensord",
+                    "ai-antivirus-engined",
+                    "ai-antivirus-responderd",
+                ],
+            )
+            .map(|_| "ai-antivirus companion services restarted".into())
         },
         "sync-antivirus" => || {
             let mut blocklist = state::open_pinned_blocklist()?;
             let mut records = std::collections::HashMap::new();
             let threats = crate::antivirus::fetch_threats();
             let count = crate::antivirus::sync_threats(&mut blocklist, &mut records, &threats);
-            Ok(format!("synced {count} threat blocks from ai-antivirus into XDP"))
+            Ok(format!(
+                "synced {count} threat blocks from ai-antivirus into XDP"
+            ))
         },
         "heal-maps" => || {
             let mut blocklist = state::open_pinned_blocklist()?;
